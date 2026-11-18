@@ -1,0 +1,27 @@
+[package]
+name = "battery-tray"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight native tray app showing wireless peripheral battery levels (mouse, headset)"
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Devices_Enumeration",
+    "Devices_Power",
+    "System_Power",
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

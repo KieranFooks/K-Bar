@@ -13,15 +13,21 @@ use crate::win32::{
 pub const BATTERY_BASE: u16 = 0xEBA0;
 /// Mouse glyph.
 pub const MOUSE: u16 = 0xE962;
+/// Keyboard glyph (rounded Fluent keyboard outline).
+pub const KEYBOARD: u16 = 0xE765;
 /// Headphones glyph.
 pub const HEADSET: u16 = 0xE7F6;
+/// Gamepad / Xbox controller glyph.
+pub const GAMEPAD: u16 = 0xE7FC;
 /// Lightning bolt glyph (charging indicator).
 pub const BOLT: u16 = 0xE945;
 
 pub const fn kind_glyph(kind: Kind) -> u16 {
     match kind {
         Kind::Mouse => MOUSE,
+        Kind::Keyboard => KEYBOARD,
         Kind::Headset => HEADSET,
+        Kind::Gamepad => GAMEPAD,
     }
 }
 
@@ -140,7 +146,9 @@ mod tests {
     #[test]
     fn kind_glyph_and_pct_formatting() {
         assert_eq!(kind_glyph(Kind::Mouse), MOUSE);
+        assert_eq!(kind_glyph(Kind::Keyboard), KEYBOARD);
         assert_eq!(kind_glyph(Kind::Headset), HEADSET);
+        assert_eq!(kind_glyph(Kind::Gamepad), GAMEPAD);
 
         let mut buf = [0u16; 8];
         let to_s = |len: usize, b: &[u16; 8]| String::from_utf16_lossy(&b[..len]);

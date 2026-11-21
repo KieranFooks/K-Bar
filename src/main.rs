@@ -1,34 +1,39 @@
-//! Battery Tray — ultra-minimal `#![no_std]` + `#![no_main]` single-threaded Windows 11 utility.
+//! Battery Tray — ultra-minimal `#![no_std]` + `#![no_main]` Windows 11 taskbar utility.
 //!
 //! Displays wireless peripheral battery levels in a passive click-through taskbar block
-//! using only `kernel32`, `kernelbase`, `imm32`, `user32`, and `gdi32` (`-nostdlib`).
+//! using only `kernel32`, `kernelbase`, `cfgmgr32`, `imm32`, `user32`, and `gdi32` (`-nostdlib`).
+//! A single background worker thread runs HID/BT polling so timeouts never block UI sync.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![windows_subsystem = "windows"]
 
+use core::ffi::c_void;
 use core::mem::MaybeUninit;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::ptr::{addr_of_mut, null, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use battery_tray::hid::{BatteryList, HidScanner};
+use battery_tray::hid::{BatteryList, HidScanner, PollOutput};
 use battery_tray::widget::WidgetWindow;
 use battery_tray::win32::{
-    CloseHandle, CreateMutexW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    ExitProcess, GetDesktopWindow, GetLastError, GetMessageW, GetModuleHandleW,
-    GetWindowThreadProcessId, ImmDisableIME, KillTimer, PostMessageW, PostQuitMessage,
-    RegisterClassW, RegisterWindowMessageW, SetProcessDpiAwarenessContext, SetTimer,
-    SetWinEventHook, SingleThreadCell, UnhookWinEvent, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    ERROR_ALREADY_EXISTS, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, HWND, HWINEVENTHOOK, MSG, OBJID_CLIENT, OBJID_WINDOW,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_CLOSE, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_POWERBROADCAST,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    CloseHandle, CreateEventW, CreateMutexW, CreateThread, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, ExitProcess, GetDesktopWindow, GetLastError, GetMessageW,
+    GetModuleHandleW, GetWindowThreadProcessId, ImmDisableIME, KillTimer, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetEvent,
+    SetProcessDpiAwarenessContext, SetTimer, SetWinEventHook, SingleThreadCell, UnhookWinEvent,
+    WaitForSingleObject, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, ERROR_ALREADY_EXISTS,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, HANDLE,
+    HWND, HWINEVENTHOOK, INFINITE, MSG, OBJID_CLIENT, OBJID_WINDOW, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_DESTROY,
+    WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
-use battery_tray::{light_theme, merge_devices, w, widget, WM_POLL_NOW, WM_SYNC_WIDGET};
+use battery_tray::{
+    light_theme, merge_devices, w, widget, WM_POLL_DONE, WM_POLL_NOW, WM_SYNC_WIDGET,
+};
 
 const POLL_TIMER_ID: usize = 100;
 const DEVICECHANGE_DEBOUNCE_TIMER_ID: usize = 101;
@@ -44,6 +49,12 @@ static NOTIFY_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
 static APP_INIT: AtomicBool = AtomicBool::new(false);
 
+static POLL_EVENT_RAW: AtomicUsize = AtomicUsize::new(0);
+static POLL_FORCE_RESCAN: AtomicBool = AtomicBool::new(false);
+static POLL_STOP: AtomicBool = AtomicBool::new(false);
+static POLL_HAS_DATA: AtomicBool = AtomicBool::new(false);
+static SLOT_LOCK: AtomicBool = AtomicBool::new(false);
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
@@ -54,8 +65,6 @@ struct AppState {
     active: bool,
     main: HWND,
     widget: Option<WidgetWindow>,
-    scanner: HidScanner,
-    polling: bool,
     syncing: bool,
     devices: BatteryList,
     light_theme: bool,
@@ -63,16 +72,21 @@ struct AppState {
     tray_tid: u32,
     tray_loc_hook: HWINEVENTHOOK,
     tray_reorder_hook: HWINEVENTHOOK,
+    worker_thread: HANDLE,
+    poll_event: HANDLE,
 }
 
 impl AppState {
-    /// Initialize `AppState` directly in `.bss` (`MaybeUninit::zeroed()`) without a large stack copy.
-    unsafe fn init_in_place(dst: *mut Self, main: HWND, light: bool) {
+    unsafe fn init_in_place(
+        dst: *mut Self,
+        main: HWND,
+        light: bool,
+        worker_thread: HANDLE,
+        poll_event: HANDLE,
+    ) {
         addr_of_mut!((*dst).active).write(true);
         addr_of_mut!((*dst).main).write(main);
         addr_of_mut!((*dst).widget).write(None);
-        HidScanner::init_in_place(addr_of_mut!((*dst).scanner));
-        addr_of_mut!((*dst).polling).write(false);
         addr_of_mut!((*dst).syncing).write(false);
         addr_of_mut!((*dst).devices).write(BatteryList::new());
         addr_of_mut!((*dst).light_theme).write(light);
@@ -80,11 +94,17 @@ impl AppState {
         addr_of_mut!((*dst).tray_tid).write(0);
         addr_of_mut!((*dst).tray_loc_hook).write(null_mut());
         addr_of_mut!((*dst).tray_reorder_hook).write(null_mut());
+        addr_of_mut!((*dst).worker_thread).write(worker_thread);
+        addr_of_mut!((*dst).poll_event).write(poll_event);
     }
 }
 
 // Stored in `.bss` via `MaybeUninit::zeroed()` so `.data` stays 0 bytes on disk.
 static APP: SingleThreadCell<MaybeUninit<AppState>> = SingleThreadCell::new(MaybeUninit::zeroed());
+static SCANNER: SingleThreadCell<MaybeUninit<HidScanner>> =
+    SingleThreadCell::new(MaybeUninit::zeroed());
+static POLL_SLOT: SingleThreadCell<MaybeUninit<PollOutput>> =
+    SingleThreadCell::new(MaybeUninit::zeroed());
 
 #[inline]
 unsafe fn app_mut() -> Option<&'static mut AppState> {
@@ -92,6 +112,67 @@ unsafe fn app_mut() -> Option<&'static mut AppState> {
         Some((*APP.get()).assume_init_mut())
     } else {
         None
+    }
+}
+
+#[inline]
+fn lock_slot() {
+    while SLOT_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn unlock_slot() {
+    SLOT_LOCK.store(false, Ordering::Release);
+}
+
+unsafe extern "system" fn poll_worker_proc(_param: *mut c_void) -> u32 {
+    let scanner_ptr = (*SCANNER.get()).as_mut_ptr();
+    HidScanner::init_in_place(scanner_ptr);
+    let scanner = &mut *scanner_ptr;
+
+    loop {
+        let ev_raw = POLL_EVENT_RAW.load(Ordering::Acquire);
+        if ev_raw == 0 || POLL_STOP.load(Ordering::Acquire) {
+            break;
+        }
+        let _ = WaitForSingleObject(ev_raw as HANDLE, INFINITE);
+        if POLL_STOP.load(Ordering::Acquire) {
+            break;
+        }
+
+        let force = POLL_FORCE_RESCAN.swap(false, Ordering::AcqRel);
+        let out = scanner.poll(force);
+        if POLL_STOP.load(Ordering::Acquire) {
+            break;
+        }
+
+        lock_slot();
+        (*POLL_SLOT.get()).write(out);
+        POLL_HAS_DATA.store(true, Ordering::Release);
+        unlock_slot();
+
+        let main_raw = MAIN_HWND_RAW.load(Ordering::Acquire);
+        if main_raw != 0 {
+            let _ = PostMessageW(main_raw as HWND, WM_POLL_DONE, 0, 0);
+        }
+    }
+
+    scanner.close();
+    0
+}
+
+unsafe fn request_poll(force_rescan: bool) {
+    if force_rescan {
+        POLL_FORCE_RESCAN.store(true, Ordering::Release);
+    }
+    let ev_raw = POLL_EVENT_RAW.load(Ordering::Acquire);
+    if ev_raw != 0 {
+        let _ = SetEvent(ev_raw as HANDLE);
     }
 }
 
@@ -186,30 +267,29 @@ unsafe fn sync_widget(force_redraw: bool) {
     }
 }
 
-unsafe fn run_poll(force_rescan: bool) {
-    let scanner_ptr = {
-        let Some(state) = app_mut() else { return };
-        if !state.active || state.polling {
-            return;
-        }
-        state.polling = true;
-        &mut state.scanner as *mut HidScanner
+unsafe fn handle_poll_done() {
+    lock_slot();
+    let out = if POLL_HAS_DATA.swap(false, Ordering::AcqRel) {
+        Some((*POLL_SLOT.get()).assume_init_read())
+    } else {
+        None
     };
+    unlock_slot();
 
-    let fresh = (*scanner_ptr).poll(force_rescan);
-
+    let Some(out) = out else { return };
     let active = {
         let Some(state) = app_mut() else { return };
-        state.polling = false;
         if !state.active {
-            state.scanner.close();
             false
         } else {
-            state.devices = merge_devices(&state.devices, fresh);
+            state.devices = merge_devices(
+                &state.devices,
+                out.devices,
+                &out.present_hid_vp[..out.present_hid_vp_len],
+            );
             true
         }
     };
-
     if active {
         sync_widget(false);
     }
@@ -220,7 +300,7 @@ unsafe fn cleanup_app_state(hwnd: HWND) {
     let _ = KillTimer(hwnd, DEVICECHANGE_DEBOUNCE_TIMER_ID);
     let _ = KillTimer(hwnd, WIDGET_SYNC_TIMER_ID);
 
-    MAIN_HWND_RAW.store(0, Ordering::Relaxed);
+    MAIN_HWND_RAW.store(0, Ordering::Release);
     DESKTOP_HWND_RAW.store(0, Ordering::Relaxed);
     TRAY_HWND_RAW.store(0, Ordering::Relaxed);
     NOTIFY_HWND_RAW.store(0, Ordering::Relaxed);
@@ -235,8 +315,22 @@ unsafe fn cleanup_app_state(hwnd: HWND) {
     state.tray_loc_hook = null_mut();
     let reorder_hook = state.tray_reorder_hook;
     state.tray_reorder_hook = null_mut();
-    if !state.polling {
-        state.scanner.close();
+    let worker = state.worker_thread;
+    state.worker_thread = null_mut();
+    let poll_ev = state.poll_event;
+    state.poll_event = null_mut();
+
+    POLL_STOP.store(true, Ordering::Release);
+    if !poll_ev.is_null() {
+        let _ = SetEvent(poll_ev);
+    }
+    if !worker.is_null() {
+        let _ = WaitForSingleObject(worker, 1500);
+        let _ = CloseHandle(worker);
+    }
+    if !poll_ev.is_null() {
+        POLL_EVENT_RAW.store(0, Ordering::Release);
+        let _ = CloseHandle(poll_ev);
     }
 
     for hook in [loc_hook, reorder_hook] {
@@ -280,7 +374,10 @@ unsafe extern "system" fn win_event_proc(
         }
     }
     let raw = MAIN_HWND_RAW.load(Ordering::Relaxed);
-    if raw != 0 && !SYNC_PENDING.swap(true, Ordering::AcqRel) && PostMessageW(raw as HWND, WM_SYNC_WIDGET, 0, 0) == 0 {
+    if raw != 0
+        && !SYNC_PENDING.swap(true, Ordering::AcqRel)
+        && PostMessageW(raw as HWND, WM_SYNC_WIDGET, 0, 0) == 0
+    {
         SYNC_PENDING.store(false, Ordering::Release);
     }
 }
@@ -288,7 +385,11 @@ unsafe extern "system" fn win_event_proc(
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
         WM_POLL_NOW => {
-            run_poll(true);
+            request_poll(true);
+            0
+        }
+        WM_POLL_DONE => {
+            handle_poll_done();
             0
         }
         WM_SYNC_WIDGET => {
@@ -323,11 +424,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_TIMER if wp == DEVICECHANGE_DEBOUNCE_TIMER_ID => {
             let _ = KillTimer(hwnd, DEVICECHANGE_DEBOUNCE_TIMER_ID);
-            run_poll(true);
+            request_poll(true);
             0
         }
         WM_TIMER if wp == POLL_TIMER_ID => {
-            run_poll(false);
+            request_poll(false);
             0
         }
         WM_TIMER if wp == WIDGET_SYNC_TIMER_ID => {
@@ -336,7 +437,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_POWERBROADCAST => {
             if wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND {
-                run_poll(true);
+                request_poll(true);
             }
             1
         }
@@ -407,14 +508,28 @@ pub extern "system" fn mainCRTStartup() -> ! {
             ExitProcess(1);
         }
 
-        MAIN_HWND_RAW.store(hwnd as usize, Ordering::Relaxed);
+        MAIN_HWND_RAW.store(hwnd as usize, Ordering::Release);
         DESKTOP_HWND_RAW.store(GetDesktopWindow() as usize, Ordering::Relaxed);
         TASKBAR_CREATED.store(
             RegisterWindowMessageW(w!("TaskbarCreated")) as usize,
             Ordering::Relaxed,
         );
 
-        AppState::init_in_place((*APP.get()).as_mut_ptr(), hwnd, light_theme());
+        let poll_event = CreateEventW(null(), 0, 0, null());
+        let worker_thread = if !poll_event.is_null() {
+            POLL_EVENT_RAW.store(poll_event as usize, Ordering::Release);
+            CreateThread(null(), 64 * 1024, poll_worker_proc, null_mut(), 0, null_mut())
+        } else {
+            null_mut()
+        };
+
+        AppState::init_in_place(
+            (*APP.get()).as_mut_ptr(),
+            hwnd,
+            light_theme(),
+            worker_thread,
+            poll_event,
+        );
         APP_INIT.store(true, Ordering::Release);
 
         sync_widget(true);

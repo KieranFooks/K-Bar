@@ -1,6 +1,6 @@
 //! Pure `raw-dylib` Win32 FFI bindings and Win64 ABI structs (`#![no_std]`, zero dependencies).
 //!
-//! Imports ONLY from `kernel32`, `kernelbase`, `imm32`, `user32`, and `gdi32`,
+//! Imports ONLY from `kernel32`, `kernelbase`, `cfgmgr32`, `imm32`, `user32`, and `gdi32`,
 //! completely avoiding `advapi32`, `sechost`, `hid`, `oleaut32`, `shell32`,
 //! `shcore`, `dwmapi`, `setupapi`, and `MSCTF.dll`.
 
@@ -268,6 +268,22 @@ pub struct BLENDFUNCTION {
     pub alpha_format: u8,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GUID {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DEVPROPKEY {
+    pub fmtid: GUID,
+    pub pid: u32,
+}
+
 // Compile-time Win64 C ABI verification
 const _: () = assert!(core::mem::size_of::<POINT>() == 8);
 const _: () = assert!(core::mem::size_of::<SIZE>() == 8);
@@ -282,13 +298,18 @@ const _: () = assert!(core::mem::size_of::<RID_DEVICE_INFO>() == 32);
 const _: () = assert!(core::mem::size_of::<BITMAPINFOHEADER>() == 40);
 const _: () = assert!(core::mem::size_of::<BITMAPINFO>() == 44);
 const _: () = assert!(core::mem::size_of::<BLENDFUNCTION>() == 4);
+const _: () = assert!(core::mem::size_of::<GUID>() == 16);
+const _: () = assert!(core::mem::size_of::<DEVPROPKEY>() == 20);
 
 // Win32 Constants
 pub const INVALID_HANDLE_VALUE: HANDLE = (-1isize) as HANDLE;
 pub const ERROR_SUCCESS: i32 = 0;
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_IO_PENDING: u32 = 997;
+pub const ERROR_INVALID_USER_BUFFER: u32 = 1784;
 pub const WAIT_OBJECT_0: u32 = 0;
+pub const INFINITE: u32 = 0xFFFF_FFFF;
 
 pub const GENERIC_READ: u32 = 0x8000_0000;
 pub const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -298,7 +319,20 @@ pub const OPEN_EXISTING: u32 = 3;
 pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
 pub const IOCTL_HID_SET_FEATURE: u32 = 0x000B_0191;
+pub const IOCTL_HID_GET_FEATURE: u32 = 0x000B_0192;
 pub const IOCTL_HID_GET_PRODUCT_STRING: u32 = 0x000B_01BE;
+
+pub const CR_SUCCESS: u32 = 0;
+pub const CM_GETIDLIST_FILTER_ENUMERATOR: u32 = 0x0000_0001;
+pub const CM_GETIDLIST_FILTER_PRESENT: u32 = 0x0000_0100;
+pub const CM_LOCATE_DEVNODE_NORMAL: u32 = 0;
+pub const CM_LOCATE_DEVNODE_PHANTOM: u32 = 1;
+pub const DEVPROP_TYPE_BYTE: u32 = 3;
+pub const DEVPROP_TYPE_UINT16: u32 = 5;
+pub const DEVPROP_TYPE_UINT32: u32 = 7;
+pub const DEVPROP_TYPE_BOOLEAN: u32 = 17;
+pub const DEVPROP_TYPE_STRING: u32 = 18;
+pub const DEVPROP_TYPE_STRING_LIST: u32 = 0x2012;
 
 pub const HKEY_CURRENT_USER: isize = (-2147483647i32) as isize;
 pub const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
@@ -379,6 +413,7 @@ pub const DT_RIGHT: u32 = 0x0002;
 pub const DT_CENTER: u32 = 0x0001;
 pub const DT_VCENTER: u32 = 0x0004;
 pub const DT_SINGLELINE: u32 = 0x0020;
+pub const DT_NOCLIP: u32 = 0x0100;
 pub const DT_NOPREFIX: u32 = 0x0800;
 
 #[link(name = "kernel32", kind = "raw-dylib")]
@@ -427,6 +462,7 @@ extern "system" {
         initial_state: BOOL,
         name: *const u16,
     ) -> HANDLE;
+    pub fn SetEvent(h: HANDLE) -> BOOL;
     pub fn ResetEvent(h: HANDLE) -> BOOL;
     pub fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
     pub fn CancelIoEx(h: HANDLE, ov: *mut OVERLAPPED) -> BOOL;
@@ -437,6 +473,44 @@ extern "system" {
         wait: BOOL,
     ) -> BOOL;
     pub fn GetTickCount64() -> u64;
+    pub fn Sleep(ms: u32);
+    pub fn CreateThread(
+        sec: *const c_void,
+        stack_size: usize,
+        start: unsafe extern "system" fn(*mut c_void) -> u32,
+        param: *mut c_void,
+        flags: u32,
+        tid: *mut u32,
+    ) -> HANDLE;
+}
+
+#[link(name = "cfgmgr32", kind = "raw-dylib")]
+extern "system" {
+    pub fn CM_Get_Device_ID_List_SizeW(
+        pul_len: *mut u32,
+        psz_filter: *const u16,
+        ul_flags: u32,
+    ) -> u32;
+    pub fn CM_Get_Device_ID_ListW(
+        psz_filter: *const u16,
+        buffer: *mut u16,
+        buffer_len: u32,
+        ul_flags: u32,
+    ) -> u32;
+    pub fn CM_Locate_DevNodeW(
+        pdn_dev_inst: *mut u32,
+        p_device_id: *const u16,
+        ul_flags: u32,
+    ) -> u32;
+    pub fn CM_Get_DevNode_PropertyW(
+        dn_dev_inst: u32,
+        property_key: *const DEVPROPKEY,
+        property_type: *mut u32,
+        property_buffer: *mut u8,
+        property_buffer_size: *mut u32,
+        ul_flags: u32,
+    ) -> u32;
+    pub fn CM_Get_Parent(pdn_dev_inst: *mut u32, dn_dev_inst: u32, ul_flags: u32) -> u32;
 }
 
 #[link(name = "kernelbase", kind = "raw-dylib")]

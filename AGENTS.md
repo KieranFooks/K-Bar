@@ -1,44 +1,46 @@
 # AGENTS.md — Battery Tray
 
 ## Project Goal & Performance Budget
-Ultra-minimal `#![no_std]` + `#![no_main]` single-threaded native Windows 11 taskbar utility written in **pure Rust** (`raw-dylib` Win32 FFI, **zero external crate dependencies**, linked with `-nostdlib`).
+Ultra-minimal `#![no_std]` + `#![no_main]` native Windows 11 taskbar utility written in **pure Rust** (`raw-dylib` Win32 FFI, **zero external crate dependencies**, linked with `-nostdlib`).
 
-- **Binary target**: **~18.5 KB** stripped PE (`opt-level = "z"`, LTO, `codegen-units = 1`, `panic = "abort"`, `strip = true`, `-nostdlib`, `--gc-sections`), **0 bytes in `.data`** (static state zero-initialized in `.bss` via `MaybeUninit::zeroed()` + `init_in_place`).
-- **Memory & zero-allocation budget**: Zero heap allocations on the UI sync/redraw path and routine HID polling (`SingleThreadCell`, fixed `[u16; 256]`/`[u16; 8]` stack buffers, single-DIB in-place premultiplied BGRA rendering, DPI-cached `HFONT`s, thread-safe local `FontCache` for `render_widget_premul_bgra`).
-- **Minimal OS / DLL footprint**: Direct PE IAT imports ONLY from `kernel32.dll`, `kernelbase.dll` (`RegGetValueW`), `imm32.dll` (`ImmDisableIME`), `user32.dll`, `gdi32.dll`, and UCRT `memset` (`api-ms-win-crt-string-l1-1-0.dll`). Completely eliminates `windows` crate, `advapi32.dll`, `sechost.dll`, `hid.dll`, `oleaut32.dll`, `setupapi.dll`, `shell32.dll`, `shcore.dll`, `dwmapi.dll`, and `MSCTF.dll`.
-- **No `___chkstk_ms` in `-nostdlib`**: Keep every function's local stack frame well below the 4 KB guard page (`wndproc` is `232 B`; `#[inline(never)] refresh_raw_candidates` is `2 680 B`); initialize static `AppState`/`HidScanner` directly in `.bss` (`init_in_place`) and close `io_event` in-place via `scanner.close()`.
-
----
-
-## Target Hardware & HID Protocols
-
-### 1. Logitech HID++ 2.0 Mice (G502 LIGHTSPEED, Unifying / Bolt / Direct USB)
-- **Discovery**: Stack-only Raw Input enumeration (`GetRawInputDeviceList` directly into `[RAWINPUTDEVICELIST; 128]`, up to 4 Logitech targets `LOGI_CAND_CAP = 4`, single-device LIGHTSPEED PIDs prioritized first), filtered to `VID == 0x046D`, `UsagePage == 0xFF00`, `Usage == 0x0002` (20-byte long HID++ 2.0 reports `0x11`) BEFORE querying device paths (`candidates_cached = true` set only on `GetRawInputDeviceList` success). Same-tick re-probing is skipped when a cached endpoint fails (`skip_*_discover`).
-- **Software ID (`sw_id`)**: Always send a non-zero `sw_id` (`0x0A`) in `buf[3] = (func << 4) | SW_ID`. Filter incoming packets strictly by `(report_id == 0x11, dev_idx, feat_idx, func, sw_id)` or HID++ error frames (`0xFF` / `0x8F` matching `(feat_idx, expected_fn_sw)`) to avoid desync with **Logitech G HUB** or unsolicited notifications.
-- **Device indices & mouse filtering**:
-  - Single-device LIGHTSPEED receivers (`0xC539`, `0xC53A`, `0xC53F`, `0xC541`, `0xC545`, `0xC547`): probed first (`dev_idx = 1`).
-  - Multi-device receivers (`0xC52B`, `0xC548`, other `0xC5xx`): probe `1..=6` and verify `0x0005` `func 2` (`getDeviceType == 3` Mouse) so keyboards/remotes paired on Unifying/Bolt are skipped.
-  - Direct wired USB devices (non-`0xC5xx`): probe `0xFF`, fallback `1`.
-- **Feature resolution**: Root `0x0000` `func 0` (`getFeature(id)`) directly for `0x1004` UnifiedBattery, `0x1000` BatteryStatus, `0x1001` BatteryVoltage. Runtime `Battery` omits device names (`poc.rs` reads `IOCTL_HID_GET_PRODUCT_STRING` separately via overlapped `hid_ioctl` without `hid.dll`).
-- **Battery parsing**:
-  - `0x1004`: query **`func 1`** (`get_status`) — `pct = r[4].min(100)`, `charging = matches!(r[6], 1 | 2 | 4)`.
-  - `0x1000`: query `func 0` — `pct = r[4].min(100)`, `charging = matches!(r[6], 1 | 2 | 4)`.
-  - `0x1001`: query `func 0` — `mv = u16::from_be_bytes([r[4], r[5]])` (`2500..=5000`), `charging = (r[6] & 0x80) != 0`, 100-entry Li-ion curve from Linux `hid-logitech-hidpp.c`.
-
-### 2. HyperX Cloud III Wireless (`VID 0x03F0`, `PID 0x05B7`)
-- **Interface filter**: `UsagePage == 0xFF13`, 62-byte reports.
-- **Packets**: Report ID `0x66`, cmd at `buf[1]`. Fallback to overlapped `DeviceIoControl(IOCTL_HID_SET_FEATURE)` if `WriteFile` fails. Validate incoming packets with `r.len() >= 5 && r[0] == 0x66 && r[1] == cmd`.
-- **Battery (`0x89`)**: If `r[2] == 0 && r[3] == 0`, headset is powered off (`pct: None`, `online: false`). Otherwise `pct = Some(r[4].min(100))`, `online = true`.
-- **Charging (`0x8A`)**: Query only when online; `charging = r[2] != 0`.
+- **Binary target**: **~39 KB** stripped PE (`opt-level = "z"`, LTO, `codegen-units = 1`, `panic = "abort"`, `strip = true`, `-nostdlib`, `--gc-sections`), **0 bytes in `.data`** (static `AppState`, `HidScanner`, `PollOutput`, and UI caches zero-initialized in `.bss` via `MaybeUninit::zeroed()` + `init_in_place`).
+- **Memory & zero-allocation budget**: Zero heap allocations on the UI sync/redraw path and routine HID/Bluetooth polling (`SingleThreadCell`, fixed stack buffers, single-DIB in-place premultiplied BGRA rendering, DPI-cached `HFONT`s, thread-safe local `FontCache` for `render_widget_premul_bgra`).
+- **Concurrency model**: UI thread (hidden broadcast window + taskbar widget + WinEvent hooks) + 1 lightweight background worker thread (`CreateThread`, `WaitForSingleObject`, spinlock-protected `PollOutput` handoff + `WM_POLL_DONE`) so HID timeouts never block UI sync or fullscreen auto-hide.
+- **Minimal OS / DLL footprint**: Direct PE IAT imports ONLY from `kernel32.dll`, `kernelbase.dll` (`RegGetValueW`), `cfgmgr32.dll` (PnP Bluetooth battery properties), `imm32.dll` (`ImmDisableIME`), `user32.dll`, `gdi32.dll`, and UCRT `memset`/`memcpy` (`api-ms-win-crt-string-l1-1-0.dll` / `api-ms-win-crt-private-l1-1-0.dll`). Completely eliminates `windows` crate, `advapi32.dll`, `sechost.dll`, `hid.dll`, `oleaut32.dll`, `setupapi.dll`, `shell32.dll`, `shcore.dll`, `dwmapi.dll`, and `MSCTF.dll`.
+- **No `___chkstk_ms` in `-nostdlib`**: Keep every function's local stack frame well below the 4 KB guard page; store large enumeration buffers (`[RAWINPUTDEVICELIST; 128]`, `[RawCandidate; 24]`, `[u16; 8192]`) directly inside `.bss` `HidScanner` (`init_in_place`) and close `io_event` in-place via `scanner.close()`.
 
 ---
 
-## UI / UX Architecture (Passive Unified Taskbar Block)
-- **100% Microsoft Windows 11 native look**: `Segoe Fluent Icons` + `Segoe UI`, grayscale `ANTIALIASED_QUALITY` coverage converted in-place to premultiplied 32bpp BGRA in a single GDI DIB (`draw_widget_to_dib`), zero third-party assets.
-- **Strict uniform monochrome integration**: Driven by `HKCU\...\Personalize\SystemUsesLightTheme` (via `kernelbase!RegGetValueW` + `RRF_RT_REG_DWORD`) and live `WM_SETTINGCHANGE`. Uniform opacity across both rows.
+## Target Hardware & Protocols (`src/drivers/`)
+
+### 1. Generic Bluetooth (`src/drivers/bluetooth.rs` via `cfgmgr32.dll`)
+- Enumerates present `BTHLE`, `BTHENUM`, `BTHHFENUM`, and `BTHLEDEVICE` devnodes (`CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT`).
+- Reads `DEVPKEY_Bluetooth_Battery` (`{104EA319-6EE2-4701-BD47-8DDBF425BBE5}, 2`) and requires `DEVPKEY_Device_IsConnected == true` (walking `CM_Get_Parent` up to 3 levels for metadata).
+- Classifies into `Mouse`, `Keyboard`, `Headset`, or `Gamepad` (e.g. Xbox Wireless Controllers) via `DEVPKEY_DeviceContainer_Category`, `DEVPKEY_Device_FriendlyName`, and `DEVPKEY_Bluetooth_ClassOfDevice` while rejecting phones, PCs, watches, cameras, printers, and displays.
+- Deduplicated in `BatteryList::upsert` in favor of `Source::NativeHid` when both transports expose the same `(vid_pid, kind)`.
+
+### 2. Logitech HID++ 2.0 / 1.0 & Vendor (`src/drivers/logitech.rs`, `VID 0x046D`)
+- Discovers mice, keyboards, and headsets across Unifying (`0xC52B` 6 slots + HID++ 1.0 `0x0D`/`0x07` fallback + `Col01` fast offline detection), Bolt, LIGHTSPEED receivers, direct USB, `0xFF43` headsets, G535 (`0x0AC4`), and G PRO X 2 LIGHTSPEED (`0x0AF7` on `0xFFA0`).
+- Uses `sw_id = 0x0A`, `getDeviceType` (`0x0005` `func 2`), and battery features `0x1004`, `0x1000`, `0x1001`, `0x1F20`.
+
+### 3. HyperX (`src/drivers/hyperx.rs`, `VID 0x03F0` & `0x0951`)
+- Cloud III Wireless (`0x03F0:0x05B7`, `0xFF13`, `0x66 0x89`/`0x8A`), Cloud Alpha Wireless (`0x098D`, `0x21 0xBB`), Cloud II Wireless HP (`0x0696`/`0x018B`), Cloud II Wireless Kingston (`0x0951:0x1718`), and Cloud Flight (`0x16C4`/`0x1723`).
+
+### 4. Razer (`src/drivers/razer.rs`, `VID 0x1532`)
+- Table-driven ~60 wireless mouse & keyboard PIDs (Viper, DeathAdder, Basilisk, Cobra, Naga, Orochi, Pro Click, BlackWidow, DeathStalker, Joro) via 90-byte `razer_report` (`IOCTL_HID_SET_FEATURE` / `GET_FEATURE` with XOR CRC, `open_hid_feature` fallback access `0`).
+
+### 5. SteelSeries (`src/drivers/steelseries.rs`, `VID 0x1038`) & Corsair (`src/drivers/corsair.rs`, `VID 0x1B1C`)
+- SteelSeries: Arctis 7+, Arctis Nova 7/7X/Gen 2 (discrete & %), Nova 5, Nova Pro Wireless, Arctis 7/Pro, Arctis 9.
+- Corsair: Bragi (`0xFF42`, properties `0x0F`/`0x10` for Virtuoso, HS80, Slipstream mice/keyboards) and Void/HS70 (`0xFFC5`, `0xC9 0x64`).
+
+---
+
+## UI / UX Architecture (Passive 2-Row × N-Column Taskbar Block)
+- **100% Microsoft Windows 11 native look**: `Segoe Fluent Icons` (`Mouse` `0xE962`, `Keyboard` `0xE765`, `Headset` `0xE7F6`, `Gamepad` `0xE7FC`, `Bolt` `0xE945`, `Battery` `0xEBA0`) + `Segoe UI`, grayscale `ANTIALIASED_QUALITY` coverage converted in-place to premultiplied 32bpp BGRA in a single GDI DIB (`draw_widget_to_dib`), zero third-party assets.
+- **2-row × N-column grid (`src/widget.rs`)**: Fixed `38 DIP` height aligned with the Windows 11 clock; 1 column for 0–2 devices, expanding horizontally to 2–3 columns for 3–6 devices.
+- **Strict uniform monochrome integration**: Driven by `HKCU\...\Personalize\SystemUsesLightTheme` (via `kernelbase!RegGetValueW` + `RRF_RT_REG_DWORD`) and live `WM_SETTINGCHANGE`. Uniform opacity across all cells.
 - **Passive click-through taskbar block (`src/widget.rs`)**:
-  - `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` `WS_POPUP` **owned by `Shell_TrayWnd`** (`win32k` ties lifecycle to the taskbar; `sync_position` atomically shows/re-raises above `Shell_TrayWnd` with `SWP_NOACTIVATE | SWP_NOOWNERZORDER` whenever Explorer re-asserts `HWND_TOPMOST` on `Shell_TrayWnd`; `hide_widget` hides with `SWP_HIDEWINDOW | SWP_NOOWNERZORDER`; `widget_proc` handles `WM_ERASEBKGND`, `WM_MOUSEACTIVATE`, `WM_NCHITTEST`; reattaches on `TaskbarCreated` if Explorer restarts; `LAST_RENDER` updates only when `UpdateLayeredWindow` succeeds; `run_poll` syncs via `sync_widget(false)`).
-  - **Fullscreen auto-hide**: Walks top-level Z-order above `Shell_TrayWnd` (catching borderless/exclusive fullscreen games and fullscreen browser videos across monitors even when focus is on another monitor or `Shell_TrayWnd` has been demoted) plus a foreground fallback (ignoring normal framed `WS_CAPTION | WS_THICKFRAME` maximized windows while `Shell_TrayWnd` is topmost, Windows 11 Shell/XAML/input overlays, click-through HUDs, and 0-alpha layered windows); driven by `EVENT_SYSTEM_FOREGROUND`, `EVENT_SYSTEM_MOVESIZEEND`, `EVENT_SYSTEM_MINIMIZESTART..=END`, `WM_DPICHANGED`, scoped `EVENT_OBJECT_LOCATIONCHANGE` + `EVENT_OBJECT_REORDER` on `Shell_TrayWnd`'s `(pid, tid)` coalesced with `SYNC_PENDING`, and a `1 000 ms` guard timer.
+  - `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` `WS_POPUP` **owned by `Shell_TrayWnd`**, fullscreen occlusion auto-hide, `1 000 ms` guard timer + WinEvent hooks coalesced via `SYNC_PENDING`.
 
 ---
 

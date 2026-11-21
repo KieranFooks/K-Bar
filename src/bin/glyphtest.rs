@@ -1,9 +1,9 @@
-//! Debug helper: render the unified 2-line taskbar block over dark and light
+//! Debug helper: render the multi-column Windows 11 taskbar block over dark and light
 //! Windows 11 taskbar backgrounds at 96 DPI and 144 DPI (1x and 2x zoom).
 //! Usage: glyphtest.exe [output.bmp]
 
 use battery_tray::{
-    hid::{Battery, BatteryList, Kind},
+    hid::{Battery, BatteryList, Kind, Source},
     widget,
 };
 
@@ -56,13 +56,18 @@ fn write_bmp(path: &str, width: usize, height: usize, rgb: &[u8]) {
     std::fs::write(path, out).expect("write bmp");
 }
 
-fn list2(mouse: Option<(u8, bool)>, headset: Option<(u8, bool)>) -> BatteryList {
+fn make_list(items: &[(Kind, u8, bool)]) -> BatteryList {
     let mut list = BatteryList::new();
-    if let Some((pct, chg)) = mouse {
-        list.set(Battery::new(Kind::Mouse, Some(pct), chg, true));
-    }
-    if let Some((pct, chg)) = headset {
-        list.set(Battery::new(Kind::Headset, Some(pct), chg, true));
+    for (idx, &(kind, pct, chg)) in items.iter().enumerate() {
+        list.upsert(Battery::with_id(
+            (idx + 1) as u64,
+            0,
+            kind,
+            Some(pct),
+            chg,
+            true,
+            Source::NativeHid,
+        ));
     }
     list
 }
@@ -72,15 +77,26 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "widget_preview.bmp".to_string());
 
-    let cases: [BatteryList; 4] = [
-        list2(Some((86, false)), Some((93, false))),
-        list2(Some((100, true)), Some((28, false))),
-        list2(Some((86, false)), None),
+    let cases: [BatteryList; 6] = [
+        make_list(&[(Kind::Mouse, 86, false), (Kind::Headset, 93, false)]),
+        make_list(&[(Kind::Mouse, 100, true), (Kind::Keyboard, 74, false)]),
+        make_list(&[
+            (Kind::Mouse, 86, false),
+            (Kind::Keyboard, 74, false),
+            (Kind::Headset, 93, false),
+        ]),
+        make_list(&[
+            (Kind::Mouse, 86, false),
+            (Kind::Keyboard, 74, false),
+            (Kind::Headset, 93, true),
+            (Kind::Gamepad, 50, false),
+        ]),
+        make_list(&[(Kind::Gamepad, 50, false)]),
         BatteryList::new(),
     ];
 
     let dpis = [96u32, 144];
-    let cell_w = 270usize;
+    let cell_w = 480usize;
     let cell_h = 200usize;
     let cols = cases.len();
     let rows = dpis.len() * 2;

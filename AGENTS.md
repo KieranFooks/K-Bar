@@ -37,9 +37,9 @@ Ultra-lightweight single-threaded native Windows 11 taskbar utility written in *
 - **100% Microsoft Windows 11 native look**: uses system fonts **`Segoe Fluent Icons`** (fallback `Segoe MDL2 Assets`) and **`Segoe UI`** — no third-party icon packs, no flashy colors, no popup menu.
 - **Strict uniform monochrome integration**: light glyphs/text on dark taskbars, dark glyphs/text on light taskbars, driven by `HKCU\...\Personalize\SystemUsesLightTheme` and live `WM_SETTINGCHANGE` updates. All rows render at uniform opacity (no dimming when sleeping).
 - **Passive click-through taskbar block (`src/widget.rs`)**:
-  - Single `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST` `WS_POPUP` window rendered with `UpdateLayeredWindow` (premultiplied 32bpp BGRA).
+  - Single `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` `WS_POPUP` window **owned by `Shell_TrayWnd`** (`win32k` enforces atomic Z-order directly above the taskbar with zero `SetWindowPos` tug-of-war, and automatically recreates/reattaches if `Shell_TrayWnd` changes on `TaskbarCreated`) rendered with `UpdateLayeredWindow` (premultiplied 32bpp BGRA).
   - Positioned cleanly to the left of `TrayNotifyWnd` on `Shell_TrayWnd`, matching the Windows 11 Clock block height (`38` DIPs centered in the `48`-DIP taskbar).
-  - **Fullscreen auto-hide**: hides automatically when the taskbar auto-hides or when an opaque foreground window covers the full monitor (`EVENT_SYSTEM_FOREGROUND` hook + lightweight 1 s check, using only `user32.dll`).
+  - **Fullscreen auto-hide**: hides automatically when the taskbar auto-hides or when a non-maximized, non-Shell-overlay foreground window covers the full monitor (`EVENT_SYSTEM_FOREGROUND` hook + lightweight 1 s check, using only `user32.dll`; ignores `IsZoomed` and Windows 11 Shell XAML overlays so focus changes never flicker).
 
 ---
 

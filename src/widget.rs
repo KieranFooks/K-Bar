@@ -1,12 +1,12 @@
 //! Unified 2-line Windows 11 taskbar block (passive click-through overlay).
 //!
 //! Renders as a single `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
-//! WS_EX_TOOLWINDOW | WS_EX_TOPMOST` per-pixel alpha window positioned directly to
-//! the left of `TrayNotifyWnd` on `Shell_TrayWnd`, matching the Windows 11 Clock
-//! typography. Auto-hides in fullscreen apps/games without loading `shell32.dll`
-//! or `shcore.dll`.
+//! WS_EX_TOOLWINDOW` popup owned by `Shell_TrayWnd`, so `win32k` keeps it
+//! atomically above the taskbar with zero Z-order flicker. Positioned directly to
+//! the left of `TrayNotifyWnd`, matching the Windows 11 Clock typography, and
+//! auto-hides in fullscreen apps/games without loading `shell32.dll` or `shcore.dll`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::Once;
 
@@ -22,14 +22,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW, GetClassNameW,
-    GetForegroundWindow, GetWindow, GetWindowRect, IsWindowVisible, RegisterClassW, SetWindowPos,
-    ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GW_HWNDPREV, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    GetForegroundWindow, GetWindow, GetWindowRect, IsWindow, IsWindowVisible, IsZoomed,
+    RegisterClassW, SetWindowPos, ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW,
+    GW_HWNDPREV, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::{hid::Battery, icon};
+
+#[derive(Clone, Copy, Debug)]
+pub struct WidgetWindow {
+    pub hwnd: HWND,
+    pub owner_tray: Option<HWND>,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct RenderKey {
@@ -44,6 +50,7 @@ struct RenderKey {
 
 thread_local! {
     static LAST_RENDER: RefCell<Option<RenderKey>> = const { RefCell::new(None) };
+    static LAST_OWNER_ATTEMPT: Cell<usize> = const { Cell::new(0) };
 }
 
 fn scale(dip: i32, dpi: u32) -> i32 {
@@ -269,6 +276,24 @@ unsafe fn window_class_name(hwnd: HWND) -> String {
         .collect()
 }
 
+/// Desktop and Windows 11 Shell XAML overlay classes that should never cause the
+/// taskbar battery widget to hide during focus transitions.
+pub fn is_shell_overlay_class(cls: &str) -> bool {
+    matches!(
+        cls,
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "NotifyIconOverflowWindow"
+            | "TaskListThumbnailWnd"
+            | "MultitaskingViewFrame"
+    )
+}
+
 unsafe fn should_show_on_taskbar(
     tray_hwnd: HWND,
     tray_rc: RECT,
@@ -294,9 +319,10 @@ unsafe fn should_show_on_taskbar(
         && fg != tray_hwnd
         && fg != widget_hwnd
         && fg != main_hwnd
+        && !IsZoomed(fg).as_bool()
     {
         let cls = window_class_name(fg);
-        if cls != "Progman" && cls != "WorkerW" {
+        if !is_shell_overlay_class(&cls) {
             let tray_mon = MonitorFromWindow(tray_hwnd, MONITOR_DEFAULTTONEAREST);
             let fg_mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
             if tray_mon == fg_mon {
@@ -328,11 +354,12 @@ unsafe fn is_above_taskbar(widget: HWND, tray: HWND) -> bool {
     false
 }
 
-/// Create the unified passive layered taskbar block window.
+/// Create the unified passive layered taskbar block window, owned by `owner_tray`
+/// when provided so `win32k` maintains atomic Z-order above the taskbar.
 ///
 /// # Safety
 /// Must be called on the UI thread.
-pub unsafe fn create() -> Option<HWND> {
+pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let hinst = GetModuleHandleW(PCWSTR::null())
@@ -352,6 +379,28 @@ pub unsafe fn create() -> Option<HWND> {
         .map(|m| HINSTANCE(m.0))
         .unwrap_or_default();
 
+    if let Some(owner) = owner_tray {
+        if let Ok(hwnd) = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("BatteryTrayWidgetClass"),
+            w!("Battery Tray"),
+            WS_POPUP,
+            0,
+            0,
+            70,
+            38,
+            Some(owner),
+            None,
+            Some(hinst),
+            None,
+        ) {
+            return Some(WidgetWindow {
+                hwnd,
+                owner_tray: Some(owner),
+            });
+        }
+    }
+
     CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         w!("BatteryTrayWidgetClass"),
@@ -367,25 +416,54 @@ pub unsafe fn create() -> Option<HWND> {
         None,
     )
     .ok()
+    .map(|hwnd| WidgetWindow {
+        hwnd,
+        owner_tray: None,
+    })
 }
 
-/// Synchronize the taskbar block's visibility, z-order, position, and rendered bitmap.
+/// Synchronize the taskbar block's ownership, visibility, position, and rendered bitmap.
 ///
 /// # Safety
 /// Must be called on the UI thread.
 pub unsafe fn sync_position(
     main: HWND,
-    widget: HWND,
+    slot: &mut Option<WidgetWindow>,
     devices: &[Battery],
     light_theme: bool,
     force_redraw: bool,
 ) {
     let Ok(tray_hwnd) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
-        if IsWindowVisible(widget).as_bool() {
-            let _ = ShowWindow(widget, SW_HIDE);
+        if let Some(w_info) = *slot {
+            if IsWindow(Some(w_info.hwnd)).as_bool() && IsWindowVisible(w_info.hwnd).as_bool() {
+                let _ = ShowWindow(w_info.hwnd, SW_HIDE);
+            }
         }
         return;
     };
+
+    let tray_raw = tray_hwnd.0 as usize;
+    let needs_create = match *slot {
+        None => true,
+        Some(w) if !IsWindow(Some(w.hwnd)).as_bool() => true,
+        Some(w) => w.owner_tray != Some(tray_hwnd) && LAST_OWNER_ATTEMPT.with(|c| c.get() != tray_raw),
+    };
+
+    let mut recreated = false;
+    if needs_create {
+        if let Some(old) = slot.take() {
+            if IsWindow(Some(old.hwnd)).as_bool() {
+                let _ = DestroyWindow(old.hwnd);
+            }
+        }
+        LAST_RENDER.with(|cell| *cell.borrow_mut() = None);
+        LAST_OWNER_ATTEMPT.with(|c| c.set(tray_raw));
+        *slot = create(Some(tray_hwnd));
+        recreated = true;
+    }
+
+    let Some(w_info) = *slot else { return };
+    let widget = w_info.hwnd;
 
     let mut tray_rc = RECT::default();
     if GetWindowRect(tray_hwnd, &mut tray_rc).is_err() {
@@ -445,7 +523,7 @@ pub unsafe fn sync_position(
 
     let needs_redraw = LAST_RENDER.with(|cell| {
         let mut last = cell.borrow_mut();
-        let changed = force_redraw || last.as_ref() != Some(&key);
+        let changed = recreated || force_redraw || last.as_ref() != Some(&key);
         if changed {
             *last = Some(key);
         }
@@ -457,20 +535,19 @@ pub unsafe fn sync_position(
         present_layered(widget, x, y, rw, rh, &rgba);
     }
 
-    let visible = IsWindowVisible(widget).as_bool();
-    if !visible {
+    if !IsWindowVisible(widget).as_bool() {
         let _ = ShowWindow(widget, SW_SHOWNOACTIVATE);
     }
 
-    if !visible || needs_redraw || !is_above_taskbar(widget, tray_hwnd) {
+    if w_info.owner_tray.is_none() && !is_above_taskbar(widget, tray_hwnd) {
         let _ = SetWindowPos(
             widget,
             Some(HWND_TOPMOST),
-            x,
-            y,
-            w,
-            h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
 }
@@ -479,9 +556,12 @@ pub unsafe fn sync_position(
 ///
 /// # Safety
 /// Must be called on the UI thread.
-pub unsafe fn destroy(widget: HWND) {
+pub unsafe fn destroy(w: WidgetWindow) {
     LAST_RENDER.with(|cell| *cell.borrow_mut() = None);
-    let _ = DestroyWindow(widget);
+    LAST_OWNER_ATTEMPT.with(|c| c.set(0));
+    if IsWindow(Some(w.hwnd)).as_bool() {
+        let _ = DestroyWindow(w.hwnd);
+    }
 }
 
 unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -578,5 +658,17 @@ mod tests {
         // Fallback when notify_rc is unavailable
         let (xf, _) = compute_widget_rect(tray, None, 70, 38, 96);
         assert_eq!(xf, 2560 - 340 - 70);
+    }
+
+    #[test]
+    fn shell_overlay_classes_are_ignored_for_fullscreen_hiding() {
+        assert!(is_shell_overlay_class("Progman"));
+        assert!(is_shell_overlay_class("WorkerW"));
+        assert!(is_shell_overlay_class("Shell_TrayWnd"));
+        assert!(is_shell_overlay_class("Windows.UI.Core.CoreWindow"));
+        assert!(is_shell_overlay_class("XamlExplorerHostIslandWindow"));
+        assert!(is_shell_overlay_class("MultitaskingViewFrame"));
+        assert!(!is_shell_overlay_class("Chrome_WidgetWin_1"));
+        assert!(!is_shell_overlay_class("UnrealWindow"));
     }
 }

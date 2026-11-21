@@ -44,7 +44,7 @@ static MAIN_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 
 struct AppState {
     main: HWND,
-    widget: Option<HWND>,
+    widget: Option<widget::WidgetWindow>,
     scanner: Option<hid::HidScanner>,
     devices: Vec<hid::Battery>,
     light_theme: bool,
@@ -55,14 +55,29 @@ thread_local! {
 }
 
 unsafe fn sync_widget(force_redraw: bool) {
-    let snapshot = APP.with(|cell| {
-        let borrow = cell.borrow();
-        let state = borrow.as_ref()?;
-        let widget = state.widget?;
-        Some((state.main, widget, state.devices.clone(), state.light_theme))
+    let taken = APP.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = borrow.as_mut()?;
+        let slot = state.widget.take();
+        Some((slot, state.main, state.devices.clone(), state.light_theme))
     });
-    if let Some((main, widget, devices, light)) = snapshot {
-        widget::sync_position(main, widget, &devices, light, force_redraw);
+    let Some((mut slot, main, devices, light)) = taken else {
+        return;
+    };
+
+    widget::sync_position(main, &mut slot, &devices, light, force_redraw);
+
+    let leftover = APP.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(state) = borrow.as_mut() {
+            state.widget = slot;
+            None
+        } else {
+            slot
+        }
+    });
+    if let Some(w) = leftover {
+        widget::destroy(w);
     }
 }
 
@@ -82,12 +97,24 @@ unsafe fn run_poll(force_rescan: bool) {
         let state = borrow.as_mut()?;
         state.scanner = Some(scanner);
         state.devices = merge_devices(&state.devices, fresh);
-        let widget = state.widget?;
-        Some((state.main, widget, state.devices.clone(), state.light_theme))
+        let slot = state.widget.take();
+        Some((slot, state.main, state.devices.clone(), state.light_theme))
     });
 
-    if let Some((main, widget, devices, light)) = snapshot {
-        widget::sync_position(main, widget, &devices, light, true);
+    if let Some((mut slot, main, devices, light)) = snapshot {
+        widget::sync_position(main, &mut slot, &devices, light, true);
+        let leftover = APP.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            if let Some(state) = borrow.as_mut() {
+                state.widget = slot;
+                None
+            } else {
+                slot
+            }
+        });
+        if let Some(w) = leftover {
+            widget::destroy(w);
+        }
     }
 }
 
@@ -252,12 +279,11 @@ fn main() {
 
         MAIN_HWND_RAW.store(hwnd.0 as usize, Ordering::Relaxed);
         let light = light_theme();
-        let widget_hwnd = widget::create();
 
         APP.with(|cell| {
             *cell.borrow_mut() = Some(AppState {
                 main: hwnd,
-                widget: widget_hwnd,
+                widget: None,
                 scanner: Some(hid::HidScanner::new()),
                 devices: Vec::new(),
                 light_theme: light,

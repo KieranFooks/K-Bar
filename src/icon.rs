@@ -694,4 +694,28 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn hicon_creation_succeeds_and_destroys_cleanly() {
+        use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+
+        unsafe {
+            for size in [16, 32] {
+                for light in [false, true] {
+                    let h1 = device_icon(Kind::Mouse, Some(86), false, true, size, light)
+                        .expect("device_icon mouse");
+                    assert!(!h1.0.is_null());
+                    assert!(DestroyIcon(h1).is_ok());
+
+                    let h2 = device_icon(Kind::Headset, Some(93), true, true, size, light)
+                        .expect("device_icon headset");
+                    assert!(!h2.0.is_null());
+                    assert!(DestroyIcon(h2).is_ok());
+                }
+            }
+            let hp = placeholder_icon(16, false).expect("placeholder_icon");
+            assert!(!hp.0.is_null());
+            assert!(DestroyIcon(hp).is_ok());
+        }
+    }
 }

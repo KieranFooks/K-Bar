@@ -144,11 +144,15 @@ unsafe fn update_tray(hwnd: HWND) {
         let Some(ic) = new_icon else { continue };
 
         if was_added {
-            tray::modify(hwnd, id, WM_TRAYICON, ic, &key.tip);
+            let _ = tray::modify(hwnd, id, WM_TRAYICON, ic, &key.tip);
         } else {
-            let _ok = tray::add(hwnd, id, WM_TRAYICON, ic, &key.tip);
+            let ok = tray::add(hwnd, id, WM_TRAYICON, ic, &key.tip);
             #[cfg(debug_assertions)]
-            eprintln!("[tray] NIM_ADD id={id} -> {_ok}");
+            eprintln!("[tray] NIM_ADD id={id} -> {ok}");
+            if !ok {
+                let _ = DestroyIcon(ic);
+                continue;
+            }
         }
 
         let old_icon = {
@@ -313,7 +317,7 @@ fn main() {
 
     // Keep single-instance mutex open for the entire lifetime of main()
     let instance_mutex = unsafe {
-        match CreateMutexW(None, false, w!("Global\\BatteryTray.SingleInstance")) {
+        match CreateMutexW(None, false, w!("Local\\BatteryTray.SingleInstance")) {
             Ok(m) => m,
             Err(_) => return,
         }

@@ -1,10 +1,10 @@
-//! Debug helper: render tray icons on dark and light backgrounds at 1x and 4x
-//! zoom into a single BMP contact sheet for visual verification.
+//! Debug helper: render the unified 2-line taskbar block (Option 1A) over dark
+//! and light Windows 11 taskbar backgrounds at 96 DPI and 144 DPI (1x and 3x).
 //! Usage: glyphtest.exe [output.bmp]
 
 use battery_tray::{
-    hid::Kind,
-    icon::{self, BATTERY_BASE},
+    hid::{Battery, Kind},
+    widget,
 };
 
 fn blend_bg(bg: (u8, u8, u8), rgba: &[u8], i: usize) -> (u8, u8, u8) {
@@ -33,7 +33,7 @@ fn write_bmp(path: &str, width: usize, height: usize, rgb: &[u8]) {
 
     out.extend_from_slice(&40u32.to_le_bytes());
     out.extend_from_slice(&(width as i32).to_le_bytes());
-    out.extend_from_slice(&(height as i32).to_le_bytes()); // bottom-up
+    out.extend_from_slice(&(height as i32).to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&24u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
@@ -56,43 +56,75 @@ fn write_bmp(path: &str, width: usize, height: usize, rgb: &[u8]) {
     std::fs::write(path, out).expect("write bmp");
 }
 
-struct VariantSpec {
-    kind: Option<Kind>,
-    pct: Option<u8>,
-    charging: bool,
-    online: bool,
+struct Case {
+    devices: Vec<Battery>,
+    hovered: bool,
+    active: bool,
+}
+
+fn dev(kind: Kind, pct: Option<u8>, charging: bool, online: bool) -> Battery {
+    Battery {
+        name: "Device".to_string(),
+        kind,
+        pct,
+        charging,
+        online,
+    }
 }
 
 fn main() {
     let out_path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "glyph_preview.bmp".to_string());
+        .unwrap_or_else(|| "widget_preview.bmp".to_string());
 
-    let variants: &[VariantSpec] = &[
-        VariantSpec { kind: Some(Kind::Mouse), pct: Some(86), charging: false, online: true },
-        VariantSpec { kind: Some(Kind::Mouse), pct: Some(100), charging: true, online: true },
-        VariantSpec { kind: Some(Kind::Mouse), pct: Some(86), charging: false, online: false },
-        VariantSpec { kind: Some(Kind::Headset), pct: Some(28), charging: false, online: true },
-        VariantSpec { kind: Some(Kind::Headset), pct: Some(9), charging: true, online: true },
-        VariantSpec { kind: Some(Kind::Headset), pct: None, charging: false, online: false },
-        VariantSpec { kind: None, pct: None, charging: false, online: false },
+    let cases = [
+        Case {
+            devices: vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
+            hovered: false,
+            active: false,
+        },
+        Case {
+            devices: vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
+            hovered: true,
+            active: false,
+        },
+        Case {
+            devices: vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
+            hovered: false,
+            active: true,
+        },
+        Case {
+            devices: vec![dev(Kind::Mouse, Some(100), true, true), dev(Kind::Headset, Some(28), false, true)],
+            hovered: true,
+            active: false,
+        },
+        Case {
+            devices: vec![dev(Kind::Mouse, Some(86), false, false), dev(Kind::Headset, None, false, false)],
+            hovered: false,
+            active: false,
+        },
+        Case {
+            devices: vec![],
+            hovered: true,
+            active: false,
+        },
     ];
-    let sizes = [16i32, 24, 32];
 
-    let cell_w = 180usize;
-    let cell_h = 152usize;
-    let cols = variants.len();
-    let rows = sizes.len() * 2; // dark + light per size
+    let dpis = [96u32, 144];
+    let cell_w = 270usize;
+    let cell_h = 200usize;
+    let cols = cases.len();
+    let rows = dpis.len() * 2;
     let width = cols * cell_w;
     let height = rows * cell_h;
-    let mut canvas = vec![0x24u8; width * height * 3];
+    let mut canvas = vec![0x20u8; width * height * 3];
 
-    for (si, &sz) in sizes.iter().enumerate() {
+    for (di, &dpi) in dpis.iter().enumerate() {
         for (ti, &light) in [false, true].iter().enumerate() {
-            let row = si * 2 + ti;
-            let bg = if light { (0xEF, 0xEF, 0xEF) } else { (0x1F, 0x1F, 0x2E) };
+            let row = di * 2 + ti;
+            let bg = if light { (0xEF, 0xEF, 0xEF) } else { (0x1F, 0x1B, 0x33) };
 
-            for (col, v) in variants.iter().enumerate() {
+            for (col, case) in cases.iter().enumerate() {
                 let x0 = col * cell_w;
                 let y0 = row * cell_h;
                 for y in y0..(y0 + cell_h) {
@@ -104,26 +136,17 @@ fn main() {
                     }
                 }
 
-                let rgba = match v.kind {
-                    Some(k) => icon::render_tray_rgba(
-                        icon::kind_glyph(k),
-                        v.pct,
-                        v.charging,
-                        v.online,
-                        sz,
-                        light,
-                    ),
-                    None => icon::render_centered_glyph_rgba(BATTERY_BASE, sz, light),
-                }
-                .expect("render icon");
+                let (w, h, rgba) =
+                    widget::render_widget_rgba(&case.devices, dpi, light, case.hovered, case.active);
+                let wu = w as usize;
+                let hu = h as usize;
 
-                let s = sz as usize;
-                // 1x native render at top-left of cell
-                for py in 0..s {
-                    for px in 0..s {
-                        let c = blend_bg(bg, &rgba, py * s + px);
-                        let dx = x0 + 8 + px;
-                        let dy = y0 + 8 + py;
+                // 1x native render
+                for py in 0..hu {
+                    for px in 0..wu {
+                        let c = blend_bg(bg, &rgba, py * wu + px);
+                        let dx = x0 + 10 + px;
+                        let dy = y0 + 10 + py;
                         let idx = (dy * width + dx) * 3;
                         canvas[idx] = c.0;
                         canvas[idx + 1] = c.1;
@@ -131,13 +154,13 @@ fn main() {
                     }
                 }
 
-                // 4x zoom (or 3x at 32px) right beside it
-                let zoom = if sz >= 32 { 3 } else { 4 };
-                let zx0 = x0 + 16 + s;
-                let zy0 = y0 + 8;
-                for py in 0..s {
-                    for px in 0..s {
-                        let c = blend_bg(bg, &rgba, py * s + px);
+                // 2x zoom below it
+                let zoom = 2usize;
+                let zx0 = x0 + 10;
+                let zy0 = y0 + 16 + hu;
+                for py in 0..hu {
+                    for px in 0..wu {
+                        let c = blend_bg(bg, &rgba, py * wu + px);
                         for zy in 0..zoom {
                             for zx in 0..zoom {
                                 let dx = zx0 + px * zoom + zx;
@@ -157,5 +180,5 @@ fn main() {
     }
 
     write_bmp(&out_path, width, height, &canvas);
-    println!("Wrote contact sheet {} ({}x{})", out_path, width, height);
+    println!("Wrote widget contact sheet {} ({}x{})", out_path, width, height);
 }

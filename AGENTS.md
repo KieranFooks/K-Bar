@@ -1,10 +1,10 @@
 # AGENTS.md — Battery Tray
 
 ## Project Goal & Performance Budget
-Lightweight native Windows 11 system tray utility written in **Rust** (`windows-rs` 0.62) that displays live battery levels and charging state for wireless peripherals in the taskbar notification area.
+Lightweight native Windows 11 taskbar utility written in **Rust** (`windows-rs` 0.62) that displays live battery levels and charging state for wireless peripherals in a **single unified 2-line taskbar block** (Option 1A).
 
 - **Memory target**: < 3 MB private working set (`PrivateMemorySize64`).
-- **CPU target**: ~0% idle CPU (100% event-driven Win32 message loop + sleepable `Condvar` HID worker).
+- **CPU target**: ~0% idle CPU (100% event-driven Win32 message loop + sleepable `Condvar` HID worker + zero-allocation cached redraws).
 - **Binary target**: small stripped release executable (`opt-level = "z"`, LTO, `codegen-units = 1`, `panic = "abort"`, `strip = true`).
 - **Zero heavy dependencies**: no webviews, no frameworks, no embedded raster/SVG image assets.
 
@@ -14,7 +14,7 @@ Lightweight native Windows 11 system tray utility written in **Rust** (`windows-
 
 ### 1. Logitech HID++ 2.0 Mice (G502 LIGHTSPEED, Unifying / Bolt / Direct USB)
 - **Interface filter**: `VID == 0x046D`, `UsagePage == 0xFF00`, `OutputReportByteLength == 20` (long HID++ 2.0 reports, `0x11`). Ignore 32-byte or 7-byte sibling interfaces so discovery never stalls.
-- **Software ID (`sw_id`)**: Always send a non-zero `sw_id` (e.g. `0x0A`) in `buf[3] = (func << 4) | SW_ID`. Filter incoming packets strictly by `(report_id == 0x11, dev_idx, feat_idx, func, sw_id)` or HID++ error frames (`0xFF` / `0x8F`) to avoid desync with background traffic from **Logitech G HUB** or unsolicited `sw_id == 0` notifications.
+- **Software ID (`sw_id`)**: Always send a non-zero `sw_id` (`0x0A`) in `buf[3] = (func << 4) | SW_ID`. Filter incoming packets strictly by `(report_id == 0x11, dev_idx, feat_idx, func, sw_id)` or HID++ error frames (`0xFF` / `0x8F`) to avoid desync with background traffic from **Logitech G HUB** or unsolicited `sw_id == 0` notifications.
 - **Device indices**:
   - Single-device LIGHTSPEED receivers (`0xC539`, `0xC53A`, `0xC53F`, `0xC541`, `0xC545`, `0xC547`): probe `dev_idx = 1` first.
   - Multi-device receivers (`0xC52B`, `0xC548`, other `0xC5xx`): probe `1..=6` with a short timeout.
@@ -33,14 +33,15 @@ Lightweight native Windows 11 system tray utility written in **Rust** (`windows-
 
 ---
 
-## UI / UX Guidelines
-- **100% Microsoft Windows 11 native look**: use system fonts **`Segoe Fluent Icons`** (fallback `Segoe MDL2 Assets`) and **`Segoe UI`** — no third-party icon packs or flashy colors.
-- **Strict monochrome taskbar integration**: white/light glyphs on dark taskbars, dark glyphs on light taskbars, driven by `HKCU\...\Personalize\SystemUsesLightTheme` and live `WM_SETTINGCHANGE` updates.
-- **Side-by-side tray icons**: one icon per peripheral with **stable `uID`** (`Mouse = 1`, `Headset = 2`, `Placeholder = 99`) so Windows 11 taskbar pinning/ordering never swaps when a device sleeps.
-- **Crisp low-DPI & HiDPI icon rendering**:
-  - `size <= 22` (16×16, 20×20): custom 3×5 pixel digits + 4×6 charging bolt + 1px knockout halo around the bottom-right pill.
-  - `size > 22` (24×24, 32×32, 48×48): SDF-antialiased rounded pill + `Segoe UI` Bold coverage mask + scaled charging bolt.
-- **Native Windows 11 flyout (`popup.rs`)**: DWM rounded corners (`DWMWCP_ROUND`), DWM immersive dark/light mode & border color, Per-Monitor DPI scaling (`GetDpiForWindow`), double-buffered GDI paint, anchored above the clicked tray icon (`Shell_NotifyIconGetRect`), dismisses on outside click (`WA_INACTIVE`) and `Escape`, and includes Refresh, Autostart (`HKCU\...\Run`), and Quit actions.
+## UI / UX Architecture (Option 1A — Unified Taskbar Block)
+- **100% Microsoft Windows 11 native look**: uses system fonts **`Segoe Fluent Icons`** (fallback `Segoe MDL2 Assets`) and **`Segoe UI`** — no third-party icon packs or flashy colors.
+- **Strict monochrome integration**: light glyphs/text on dark taskbars, dark glyphs/text on light taskbars, driven by `HKCU\...\Personalize\SystemUsesLightTheme` and live `WM_SETTINGCHANGE` updates.
+- **Unified 2-line taskbar block (`src/widget.rs`)**:
+  - Single `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST` `WS_POPUP` window rendered with `UpdateLayeredWindow` (premultiplied 32bpp BGRA).
+  - Positioned cleanly to the left of `TrayNotifyWnd` on `Shell_TrayWnd`, matching the Windows 11 Clock block height (`38` DIPs centered in the `48`-DIP taskbar) with subtle rounded hover/active pill highlights.
+  - **Fullscreen auto-hide**: hides automatically when `SHQueryUserNotificationState` reports `QUNS_RUNNING_D3D_FULL_SCREEN`, when the taskbar auto-hides, or when an opaque foreground window covers the full monitor (`EVENT_SYSTEM_FOREGROUND` hook + lightweight 1 s check).
+  - **Horizontal drag-to-adjust**: users can drag the block horizontally along the taskbar; the offset (`OffsetX`) persists in `HKCU\Software\BatteryTray` and can be reset from the flyout (`Réinitialiser la position`).
+- **Native Windows 11 flyout (`src/popup.rs`)**: DWM rounded corners (`DWMWCP_ROUND`), DWM immersive dark/light mode & border color, Per-Monitor DPI scaling (`GetDpiForWindow`), double-buffered GDI paint, anchored directly above the taskbar block, dismisses on outside click (`WA_INACTIVE`) and `Escape`, and includes **Actualiser**, **Lancer au démarrage** (`HKCU\...\Run`), optional **Réinitialiser la position**, and **Quitter**.
 
 ---
 
@@ -48,8 +49,8 @@ Lightweight native Windows 11 system tray utility written in **Rust** (`windows-
 1. **Never use `HWND_MESSAGE` for the main hidden window**: Windows does **not** deliver broadcast messages (`WM_SETTINGCHANGE`, `TaskbarCreated`, `WM_DEVICECHANGE`, `WM_POWERBROADCAST`) to message-only windows. Always create a hidden top-level window (`parent = None`, `WS_EX_TOOLWINDOW`, never shown).
 2. **Never hold `STATE.0` mutex across Win32 window/message calls**: Calling `DestroyWindow` or `SendMessageW` while locking `STATE.0` causes an immediate deadlock when `WM_DESTROY` or another handler locks `STATE.0`. Snapshot state, drop the lock, then call Win32.
 3. **Always retire cancelled overlapped HID I/O**: After `CancelIoEx(h, Some(&ov))`, call `GetOverlappedResult(h, &ov, &mut got, true)` before closing the event handle or dropping the buffer so the kernel cannot write into freed stack/heap memory.
-4. **Never derive icon alpha from pixel luminance**: Luminance-to-alpha makes dark-on-light icons invisible and punches holes in dark pill text. Always render glyphs white-on-black with `ANTIALIASED_QUALITY` (grayscale coverage, zero ClearType RGB fringes), composite straight RGBA layers, convert to premultiplied BGRA, and pair with a 1bpp AND mask.
-5. **Zero handle leaks**: Every `CreateEventW`, `CreateCompatibleDC`, `CreateDIBSection`/`CreateCompatibleBitmap`, `CreateFontW`, `CreateSolidBrush`, `CreatePen`, and `HICON` must restore previous DC selections and be destroyed (`DeleteObject`/`DeleteDC`/`ReleaseDC`/`CloseHandle`/`DestroyIcon`).
+4. **Never use ClearType or luminance-to-alpha**: Always render text/glyphs white-on-black with `ANTIALIASED_QUALITY` (grayscale coverage, zero ClearType RGB fringes), composite straight RGBA layers, and convert via `rgba_to_premul_bgra` before `UpdateLayeredWindow`.
+5. **Zero handle leaks**: Every `CreateEventW`, `CreateCompatibleDC`, `CreateDIBSection`/`CreateCompatibleBitmap`, `CreateFontW`, `CreateSolidBrush`, `CreatePen`, and `HWINEVENTHOOK` must restore previous DC selections and be destroyed (`DeleteObject`/`DeleteDC`/`ReleaseDC`/`CloseHandle`/`UnhookWinEvent`).
 
 ---
 
@@ -63,28 +64,14 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
 cargo test
 
 # Lint / check all binaries
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 
-# Release build (stripped, LTO, ~300 KB)
+# Release build (stripped, LTO)
 cargo build --release
 
 # Live HID hardware probe (does not launch GUI)
 cargo run --bin poc
 
-# Render tray icon contact sheet for visual verification
-cargo run --bin glyphtest -- target\glyph_preview.bmp
-
-# Memory / CPU / Handle profiling over a poll interval
-Start-Process .\target\release\battery-tray.exe
-Start-Sleep -Seconds 5
-$p1 = Get-Process battery-tray
-Start-Sleep -Seconds 40
-$p2 = Get-Process battery-tray
-[pscustomobject]@{
-    PrivateMB = [math]::Round($p2.PrivateMemorySize64 / 1MB, 2)
-    Threads   = $p2.Threads.Count
-    Handles0  = $p1.HandleCount
-    Handles1  = $p2.HandleCount
-    CpuDeltaS = [math]::Round($p2.CPU - $p1.CPU, 4)
-}
+# Render Option 1A taskbar block contact sheet for visual verification
+cargo run --bin glyphtest -- target\widget_preview.bmp
 ```

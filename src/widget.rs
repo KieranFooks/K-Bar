@@ -13,15 +13,18 @@ use crate::w;
 use crate::win32::{
     CreateCompatibleDC, CreateDIBSection, CreateWindowExW, DefWindowProcW, DeleteDC,
     DeleteObject, DestroyWindow, DrawTextW, FindWindowExW, FindWindowW, GetClassNameW, GetDC,
-    GetDpiForWindow, GetForegroundWindow, GetModuleHandleW, GetMonitorInfoW, GetWindow,
-    GetWindowRect, IsWindow, IsWindowVisible, IsZoomed, MonitorFromWindow, RegisterClassW,
-    ReleaseDC, SelectObject, SetBkMode, SetTextColor, SetWindowPos, ShowWindow, SingleThreadCell,
-    UpdateLayeredWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    GW_HWNDPREV, HBITMAP, HDC, HGDIOBJ, HWND, HWND_TOPMOST, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    POINT, RECT, SIZE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
-    TRANSPARENT, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GetDpiForWindow, GetForegroundWindow, GetLayeredWindowAttributes, GetModuleHandleW,
+    GetMonitorInfoW, GetWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, MonitorFromWindow, RegisterClassW, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, SetWindowPos, SingleThreadCell, UpdateLayeredWindow, AC_SRC_ALPHA,
+    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV,
+    HBITMAP, HDC, HGDIOBJ, HTTRANSPARENT, HWND, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, POINT, RECT, SIZE, SWP_HIDEWINDOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, TRANSPARENT,
+    ULW_ALPHA, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSW, WS_CAPTION,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP, WS_THICKFRAME,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +115,39 @@ pub fn is_shell_overlay_class_utf16(wide: &[u16]) -> bool {
         || eq_ascii_utf16(wide, b"NotifyIconOverflowWindow")
         || eq_ascii_utf16(wide, b"TaskListThumbnailWnd")
         || eq_ascii_utf16(wide, b"MultitaskingViewFrame")
+        || eq_ascii_utf16(wide, b"ForegroundStaging")
+        || eq_ascii_utf16(wide, b"TaskSwitcherWnd")
+        || eq_ascii_utf16(wide, b"ApplicationManager_DesktopShellWindow")
+        || eq_ascii_utf16(wide, b"Shell_InputSwitchTopLevelWindow")
+        || eq_ascii_utf16(wide, b"EdgeUiInputTopWndClass")
+        || eq_ascii_utf16(wide, b"Windows.UI.Input.InputSite.WindowClass")
+        || eq_ascii_utf16(wide, b"tooltips_class32")
+        || eq_ascii_utf16(wide, b"SysShadow")
+        || eq_ascii_utf16(wide, b"IME")
+        || eq_ascii_utf16(wide, b"MSCTFIME UI")
+}
+
+/// Returns `true` when `outer` covers `inner` with a 2 px tolerance.
+pub fn rect_covers_rect(outer: RECT, inner: RECT) -> bool {
+    outer.left <= inner.left + 2
+        && outer.top <= inner.top + 2
+        && outer.right >= inner.right - 2
+        && outer.bottom >= inner.bottom - 2
+}
+
+/// Returns `true` when `rc` covers monitor bounds `mon_rc` with a 2 px tolerance.
+pub fn rect_covers_monitor(rc: RECT, mon_rc: RECT) -> bool {
+    rect_covers_rect(rc, mon_rc)
+}
+
+/// Returns `true` for click-through/non-activating overlay HUDs (GeForce, Discord, Blish HUD, tooltips).
+pub fn is_overlay_ex_style(ex_style: u32) -> bool {
+    (ex_style & (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0
+}
+
+/// Returns `true` for normal framed maximized desktop apps when the taskbar is still topmost.
+pub fn is_normal_maximized_frame(zoomed: bool, style: u32, tray_is_topmost: bool) -> bool {
+    zoomed && tray_is_topmost && (style & WS_CAPTION) == WS_CAPTION && (style & WS_THICKFRAME) != 0
 }
 
 /// Single-DIB monochrome GDI render producing premultiplied 32bpp BGRA in `bits`.
@@ -395,6 +431,47 @@ pub fn compute_widget_rect(
     (x, y)
 }
 
+unsafe fn is_zero_alpha_layered(hwnd: HWND, ex_style: u32) -> bool {
+    if (ex_style & WS_EX_LAYERED) == 0 {
+        return false;
+    }
+    let mut alpha = 0u8;
+    let mut flags = 0u32;
+    GetLayeredWindowAttributes(hwnd, null_mut(), &mut alpha, &mut flags) != 0
+        && (flags & LWA_ALPHA) != 0
+        && alpha == 0
+}
+
+unsafe fn is_shell_overlay_window(hwnd: HWND) -> bool {
+    let mut cls_buf = [0u16; 64];
+    let cls_len = GetClassNameW(hwnd, cls_buf.as_mut_ptr(), cls_buf.len() as i32);
+    let cls_slice = if cls_len > 0 {
+        &cls_buf[..(cls_len as usize).min(cls_buf.len())]
+    } else {
+        &[]
+    };
+    is_shell_overlay_class_utf16(cls_slice)
+}
+
+unsafe fn hide_widget(hwnd: HWND) {
+    if IsWindow(hwnd) != 0 && IsWindowVisible(hwnd) != 0 {
+        let _ = SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | SWP_NOOWNERZORDER
+                | SWP_HIDEWINDOW,
+        );
+    }
+}
+
 unsafe fn should_show_on_taskbar(
     tray_hwnd: HWND,
     tray_rc: RECT,
@@ -413,33 +490,56 @@ unsafe fn should_show_on_taskbar(
         return false;
     }
 
+    let tray_is_topmost = (GetWindowLongW(tray_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST) != 0;
+
+    // Walk top-level windows above `Shell_TrayWnd` to catch borderless/exclusive fullscreen
+    // games and browser videos even when Explorer demoted the taskbar or focus moved to Monitor 2.
+    let mut cur = GetWindow(tray_hwnd, GW_HWNDPREV);
+    let mut steps = 0;
+    while steps < 1024 && !cur.is_null() {
+        steps += 1;
+        if cur != widget_hwnd
+            && cur != main_hwnd
+            && IsWindowVisible(cur) != 0
+            && IsIconic(cur) == 0
+        {
+            let ex = GetWindowLongW(cur, GWL_EXSTYLE) as u32;
+            if !is_overlay_ex_style(ex) && !is_zero_alpha_layered(cur, ex) {
+                let mut cur_rc = RECT::default();
+                if GetWindowRect(cur, &mut cur_rc) != 0 {
+                    let covers = rect_covers_monitor(cur_rc, mon_rc)
+                        || (!tray_is_topmost && rect_covers_rect(cur_rc, tray_rc));
+                    if covers && !is_shell_overlay_window(cur) {
+                        return false;
+                    }
+                }
+            }
+        }
+        cur = GetWindow(cur, GW_HWNDPREV);
+    }
+
+    // Belt-and-suspenders check on the foreground window before Explorer demotes `Shell_TrayWnd`.
     let fg = GetForegroundWindow();
     if !fg.is_null()
-        && IsWindowVisible(fg) != 0
         && fg != tray_hwnd
         && fg != widget_hwnd
         && fg != main_hwnd
-        && IsZoomed(fg) == 0
+        && IsWindowVisible(fg) != 0
+        && IsIconic(fg) == 0
     {
-        let mut cls_buf = [0u16; 64];
-        let cls_len = GetClassNameW(fg, cls_buf.as_mut_ptr(), cls_buf.len() as i32);
-        let cls_slice = if cls_len > 0 {
-            &cls_buf[..(cls_len as usize).min(cls_buf.len())]
-        } else {
-            &[]
-        };
-        if !is_shell_overlay_class_utf16(cls_slice) {
+        let fg_ex = GetWindowLongW(fg, GWL_EXSTYLE) as u32;
+        if !is_overlay_ex_style(fg_ex) && !is_zero_alpha_layered(fg, fg_ex) {
             let tray_mon = MonitorFromWindow(tray_hwnd, MONITOR_DEFAULTTONEAREST);
             let fg_mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
             if tray_mon == fg_mon {
                 let mut fg_rc = RECT::default();
-                if GetWindowRect(fg, &mut fg_rc) != 0
-                    && fg_rc.left <= mon_rc.left
-                    && fg_rc.top <= mon_rc.top
-                    && fg_rc.right >= mon_rc.right
-                    && fg_rc.bottom >= mon_rc.bottom
-                {
-                    return false;
+                if GetWindowRect(fg, &mut fg_rc) != 0 && rect_covers_monitor(fg_rc, mon_rc) {
+                    let fg_style = GetWindowLongW(fg, GWL_STYLE) as u32;
+                    if !is_normal_maximized_frame(IsZoomed(fg) != 0, fg_style, tray_is_topmost)
+                        && !is_shell_overlay_window(fg)
+                    {
+                        return false;
+                    }
                 }
             }
         }
@@ -451,7 +551,7 @@ unsafe fn should_show_on_taskbar(
 unsafe fn is_above_taskbar(widget: HWND, tray: HWND) -> bool {
     let mut cur = GetWindow(tray, GW_HWNDPREV);
     let mut i = 0;
-    while i < 64 && !cur.is_null() {
+    while i < 256 && !cur.is_null() {
         if cur == widget {
             return true;
         }
@@ -555,9 +655,7 @@ pub unsafe fn sync_position(
     let tray_hwnd = FindWindowW(w!("Shell_TrayWnd"), null());
     if tray_hwnd.is_null() {
         if let Some(w_info) = *slot {
-            if IsWindow(w_info.hwnd) != 0 && IsWindowVisible(w_info.hwnd) != 0 {
-                let _ = ShowWindow(w_info.hwnd, SW_HIDE);
-            }
+            hide_widget(w_info.hwnd);
         }
         return (None, None);
     }
@@ -609,9 +707,7 @@ pub unsafe fn sync_position(
     };
 
     if !should_show_on_taskbar(tray_hwnd, tray_rc, mon_rc, main, widget) {
-        if IsWindowVisible(widget) != 0 {
-            let _ = ShowWindow(widget, SW_HIDE);
-        }
+        hide_widget(widget);
         return (Some(tray_hwnd), notify_opt);
     }
 
@@ -651,20 +747,14 @@ pub unsafe fn sync_position(
         cache.key = key;
     }
 
-    if IsWindowVisible(widget) == 0 {
-        let _ = ShowWindow(widget, SW_SHOWNOACTIVATE);
-    }
-
-    if w_info.owner_tray.is_none() && !is_above_taskbar(widget, tray_hwnd) {
-        let _ = SetWindowPos(
-            widget,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+    let visible = IsWindowVisible(widget) != 0;
+    let needs_z = !is_above_taskbar(widget, tray_hwnd);
+    if !visible || needs_z {
+        let mut flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        if !visible {
+            flags |= SWP_SHOWWINDOW;
+        }
+        let _ = SetWindowPos(widget, HWND_TOPMOST, 0, 0, 0, 0, flags);
     }
 
     (Some(tray_hwnd), notify_opt)
@@ -684,7 +774,12 @@ pub unsafe fn destroy(w: WidgetWindow) {
 }
 
 unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    DefWindowProcW(hwnd, msg, wp, lp)
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_MOUSEACTIVATE => MA_NOACTIVATE,
+        WM_NCHITTEST => HTTRANSPARENT,
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
 #[cfg(test)]
@@ -765,19 +860,110 @@ mod tests {
     #[test]
     fn shell_overlay_classes_are_ignored_for_fullscreen_hiding() {
         let to_u16 = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
-        assert!(is_shell_overlay_class_utf16(&to_u16("Progman")));
-        assert!(is_shell_overlay_class_utf16(&to_u16("WorkerW")));
-        assert!(is_shell_overlay_class_utf16(&to_u16("Shell_TrayWnd")));
-        assert!(is_shell_overlay_class_utf16(&to_u16(
-            "Windows.UI.Core.CoreWindow"
-        )));
-        assert!(is_shell_overlay_class_utf16(&to_u16(
-            "XamlExplorerHostIslandWindow"
-        )));
-        assert!(is_shell_overlay_class_utf16(&to_u16(
-            "MultitaskingViewFrame"
-        )));
-        assert!(!is_shell_overlay_class_utf16(&to_u16("Chrome_WidgetWin_1")));
-        assert!(!is_shell_overlay_class_utf16(&to_u16("UnrealWindow")));
+        for ignored in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "Windows.UI.Core.CoreWindow",
+            "XamlExplorerHostIslandWindow",
+            "TopLevelWindowForOverflowXamlIsland",
+            "NotifyIconOverflowWindow",
+            "TaskListThumbnailWnd",
+            "MultitaskingViewFrame",
+            "ForegroundStaging",
+            "TaskSwitcherWnd",
+            "ApplicationManager_DesktopShellWindow",
+            "Shell_InputSwitchTopLevelWindow",
+            "EdgeUiInputTopWndClass",
+            "Windows.UI.Input.InputSite.WindowClass",
+            "tooltips_class32",
+            "SysShadow",
+            "IME",
+            "MSCTFIME UI",
+        ] {
+            assert!(
+                is_shell_overlay_class_utf16(&to_u16(ignored)),
+                "expected ignored shell class: {ignored}"
+            );
+        }
+        for app in [
+            "ArenaNet_Dx_Window_Class",
+            "Chrome_WidgetWin_1",
+            "MozillaWindowClass",
+            "UnrealWindow",
+        ] {
+            assert!(
+                !is_shell_overlay_class_utf16(&to_u16(app)),
+                "expected app class not ignored: {app}"
+            );
+        }
+    }
+
+    #[test]
+    fn fullscreen_rect_and_style_helpers_match_expected_cases() {
+        let mon = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        assert!(rect_covers_monitor(mon, mon));
+        assert!(rect_covers_monitor(
+            RECT {
+                left: 2,
+                top: 2,
+                right: 2558,
+                bottom: 1438,
+            },
+            mon
+        ));
+        assert!(!rect_covers_monitor(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1392,
+            },
+            mon
+        ));
+        assert!(rect_covers_rect(
+            RECT {
+                left: -8,
+                top: -8,
+                right: 2568,
+                bottom: 1448,
+            },
+            RECT {
+                left: 0,
+                top: 1392,
+                right: 2560,
+                bottom: 1440,
+            }
+        ));
+
+        assert!(!is_overlay_ex_style(0));
+        assert!(!is_overlay_ex_style(WS_EX_TOPMOST | WS_EX_LAYERED));
+        assert!(is_overlay_ex_style(WS_EX_TRANSPARENT));
+        assert!(is_overlay_ex_style(WS_EX_TOOLWINDOW));
+        assert!(is_overlay_ex_style(WS_EX_NOACTIVATE));
+
+        assert!(is_normal_maximized_frame(
+            true,
+            WS_CAPTION | WS_THICKFRAME,
+            true
+        ));
+        assert!(!is_normal_maximized_frame(
+            true,
+            WS_CAPTION | WS_THICKFRAME,
+            false
+        ));
+        assert!(!is_normal_maximized_frame(true, 0, true));
+        assert!(!is_normal_maximized_frame(true, WS_THICKFRAME, true));
+        assert!(!is_normal_maximized_frame(
+            false,
+            WS_CAPTION | WS_THICKFRAME,
+            true
+        ));
     }
 }

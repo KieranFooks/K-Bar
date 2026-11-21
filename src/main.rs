@@ -17,16 +17,16 @@ use battery_tray::hid::{BatteryList, HidScanner};
 use battery_tray::widget::WidgetWindow;
 use battery_tray::win32::{
     CloseHandle, CreateMutexW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    ExitProcess, GetLastError, GetMessageW, GetModuleHandleW, GetWindowThreadProcessId,
-    ImmDisableIME, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetProcessDpiAwarenessContext, SetTimer, SetWinEventHook,
-    SingleThreadCell, UnhookWinEvent, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    ERROR_ALREADY_EXISTS, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, HWND,
-    HWINEVENTHOOK, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPED,
+    ExitProcess, GetDesktopWindow, GetLastError, GetMessageW, GetModuleHandleW,
+    GetWindowThreadProcessId, ImmDisableIME, KillTimer, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SetProcessDpiAwarenessContext, SetTimer,
+    SetWinEventHook, SingleThreadCell, UnhookWinEvent, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    ERROR_ALREADY_EXISTS, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, HWND, HWINEVENTHOOK, MSG, OBJID_CLIENT, OBJID_WINDOW,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_CLOSE, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_POWERBROADCAST,
+    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use battery_tray::{light_theme, merge_devices, w, widget, WM_POLL_NOW, WM_SYNC_WIDGET};
 
@@ -34,10 +34,11 @@ const POLL_TIMER_ID: usize = 100;
 const DEVICECHANGE_DEBOUNCE_TIMER_ID: usize = 101;
 const WIDGET_SYNC_TIMER_ID: usize = 102;
 const POLL_INTERVAL_MS: u32 = 45_000;
-const WIDGET_SYNC_INTERVAL_MS: u32 = 5_000;
+const WIDGET_SYNC_INTERVAL_MS: u32 = 1_000;
 
 static TASKBAR_CREATED: AtomicUsize = AtomicUsize::new(0);
 static MAIN_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
+static DESKTOP_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 static TRAY_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 static NOTIFY_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
@@ -61,6 +62,7 @@ struct AppState {
     tray_pid: u32,
     tray_tid: u32,
     tray_loc_hook: HWINEVENTHOOK,
+    tray_reorder_hook: HWINEVENTHOOK,
 }
 
 impl AppState {
@@ -77,6 +79,7 @@ impl AppState {
         addr_of_mut!((*dst).tray_pid).write(0);
         addr_of_mut!((*dst).tray_tid).write(0);
         addr_of_mut!((*dst).tray_loc_hook).write(null_mut());
+        addr_of_mut!((*dst).tray_reorder_hook).write(null_mut());
     }
 }
 
@@ -106,7 +109,11 @@ unsafe fn update_tray_tracking(tray_hwnd: Option<HWND>, notify_hwnd: Option<HWND
     if !state.active {
         return;
     }
-    if state.tray_pid == pid && state.tray_tid == tid && !state.tray_loc_hook.is_null() {
+    if state.tray_pid == pid
+        && state.tray_tid == tid
+        && !state.tray_loc_hook.is_null()
+        && !state.tray_reorder_hook.is_null()
+    {
         return;
     }
     if !state.tray_loc_hook.is_null() {
@@ -114,11 +121,25 @@ unsafe fn update_tray_tracking(tray_hwnd: Option<HWND>, notify_hwnd: Option<HWND
         state.tray_loc_hook = null_mut();
         let _ = UnhookWinEvent(old_hook);
     }
+    if !state.tray_reorder_hook.is_null() {
+        let old_hook = state.tray_reorder_hook;
+        state.tray_reorder_hook = null_mut();
+        let _ = UnhookWinEvent(old_hook);
+    }
     state.tray_pid = pid;
     state.tray_tid = tid;
     state.tray_loc_hook = SetWinEventHook(
         EVENT_OBJECT_LOCATIONCHANGE,
         EVENT_OBJECT_LOCATIONCHANGE,
+        null_mut(),
+        Some(win_event_proc),
+        pid,
+        tid,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+    );
+    state.tray_reorder_hook = SetWinEventHook(
+        EVENT_OBJECT_REORDER,
+        EVENT_OBJECT_REORDER,
         null_mut(),
         Some(win_event_proc),
         pid,
@@ -177,35 +198,20 @@ unsafe fn run_poll(force_rescan: bool) {
 
     let fresh = (*scanner_ptr).poll(force_rescan);
 
-    let (main, mut slot, devices, light) = {
+    let active = {
         let Some(state) = app_mut() else { return };
         state.polling = false;
         if !state.active {
             state.scanner.close();
-            return;
+            false
+        } else {
+            state.devices = merge_devices(&state.devices, fresh);
+            true
         }
-        state.devices = merge_devices(&state.devices, fresh);
-        (state.main, state.widget.take(), state.devices, state.light_theme)
     };
 
-    let (tray_hwnd, notify_hwnd) = widget::sync_position(main, &mut slot, &devices, light, true);
-
-    let mut leftover = None;
-    if let Some(state) = app_mut() {
-        if state.active {
-            if let Some(orphan) = state.widget.take() {
-                leftover = Some(orphan);
-            }
-            state.widget = slot;
-            update_tray_tracking(tray_hwnd, notify_hwnd);
-        } else {
-            leftover = slot;
-        }
-    } else {
-        leftover = slot;
-    }
-    if let Some(w) = leftover {
-        widget::destroy(w);
+    if active {
+        sync_widget(false);
     }
 }
 
@@ -215,6 +221,7 @@ unsafe fn cleanup_app_state(hwnd: HWND) {
     let _ = KillTimer(hwnd, WIDGET_SYNC_TIMER_ID);
 
     MAIN_HWND_RAW.store(0, Ordering::Relaxed);
+    DESKTOP_HWND_RAW.store(0, Ordering::Relaxed);
     TRAY_HWND_RAW.store(0, Ordering::Relaxed);
     NOTIFY_HWND_RAW.store(0, Ordering::Relaxed);
 
@@ -226,12 +233,16 @@ unsafe fn cleanup_app_state(hwnd: HWND) {
     let widget_opt = state.widget.take();
     let loc_hook = state.tray_loc_hook;
     state.tray_loc_hook = null_mut();
+    let reorder_hook = state.tray_reorder_hook;
+    state.tray_reorder_hook = null_mut();
     if !state.polling {
         state.scanner.close();
     }
 
-    if !loc_hook.is_null() {
-        let _ = UnhookWinEvent(loc_hook);
+    for hook in [loc_hook, reorder_hook] {
+        if !hook.is_null() {
+            let _ = UnhookWinEvent(hook);
+        }
     }
     if let Some(w) = widget_opt {
         widget::destroy(w);
@@ -247,15 +258,25 @@ unsafe extern "system" fn win_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    if id_object != 0 {
-        return;
-    }
-    if event == EVENT_OBJECT_LOCATIONCHANGE {
-        let h = hwnd as usize;
-        let tray = TRAY_HWND_RAW.load(Ordering::Relaxed);
-        let notify = NOTIFY_HWND_RAW.load(Ordering::Relaxed);
-        if h != tray && (notify == 0 || h != notify) {
+    if event == EVENT_OBJECT_REORDER {
+        if id_object != OBJID_CLIENT && id_object != OBJID_WINDOW {
             return;
+        }
+        let desk = DESKTOP_HWND_RAW.load(Ordering::Relaxed);
+        if desk == 0 || (hwnd as usize) != desk {
+            return;
+        }
+    } else {
+        if id_object != OBJID_WINDOW {
+            return;
+        }
+        if event == EVENT_OBJECT_LOCATIONCHANGE {
+            let h = hwnd as usize;
+            let tray = TRAY_HWND_RAW.load(Ordering::Relaxed);
+            let notify = NOTIFY_HWND_RAW.load(Ordering::Relaxed);
+            if h != tray && (notify == 0 || h != notify) {
+                return;
+            }
         }
     }
     let raw = MAIN_HWND_RAW.load(Ordering::Relaxed);
@@ -387,6 +408,7 @@ pub extern "system" fn mainCRTStartup() -> ! {
         }
 
         MAIN_HWND_RAW.store(hwnd as usize, Ordering::Relaxed);
+        DESKTOP_HWND_RAW.store(GetDesktopWindow() as usize, Ordering::Relaxed);
         TASKBAR_CREATED.store(
             RegisterWindowMessageW(w!("TaskbarCreated")) as usize,
             Ordering::Relaxed,

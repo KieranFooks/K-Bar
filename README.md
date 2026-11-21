@@ -7,7 +7,7 @@ Minimalist `#![no_std]` + `#![no_main]` native Windows 11 utility (zero external
 ## Features
 
 - **Native taskbar overlay**: click-through (`WS_EX_TRANSPARENT`), owned by `Shell_TrayWnd` (no focus flicker), rendered with `Segoe Fluent Icons` + `Segoe UI`, automatically matching Windows 11 light/dark theme (`WM_SETTINGCHANGE`) and per-monitor DPI (`WM_DPICHANGED`).
-- **Fullscreen auto-hide**: event-driven via WinEvent hooks (`EVENT_SYSTEM_FOREGROUND`, `MOVESIZEEND`, `MINIMIZE*`, `OBJECT_LOCATIONCHANGE`) plus a 5 s guard timer.
+- **Fullscreen auto-hide**: event-driven via WinEvent hooks (`EVENT_SYSTEM_FOREGROUND`, `MOVESIZEEND`, `MINIMIZE*`, `OBJECT_LOCATIONCHANGE`, `OBJECT_REORDER`) and Z-order occlusion scanning (catches borderless fullscreen games and fullscreen videos even across monitors) plus a 1 s guard timer.
 - **Live updates**: polls every **45 seconds**, plus immediate refresh on USB plug/unplug (`WM_DEVICECHANGE`) and resume from sleep (`WM_POWERBROADCAST`).
 - **Ultra-lean Win32 footprint**: pure `raw-dylib` FFI (`kernel32`, `kernelbase`, `user32`, `gdi32`, `imm32`), single-threaded, zero heap allocations on the UI/poll fast path.
 
@@ -15,13 +15,13 @@ Minimalist `#![no_std]` + `#![no_main]` native Windows 11 utility (zero external
 
 | Metric | Current (`#![no_std]` `-nostdlib`) |
 | --- | --- |
-| Binary size | **18,944 B (18.5 KB)** (`0 B` `.data`) |
+| Binary size | **19,968 B (19.5 KB)** (`0 B` `.data`) |
 | Cargo dependencies | **0 external crates** |
 | Private RAM (`PrivateMemorySize64`) | **1.21 MB** |
 | Threads | **1** |
 | Kernel handles | **84** |
 | Loaded modules / DLLs | **16** |
-| UI guard timer | **5,000 ms** (event-driven hooks) |
+| UI guard timer | **1,000 ms** (event-driven hooks) |
 
 ## Build & Run
 

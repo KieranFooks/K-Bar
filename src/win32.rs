@@ -305,8 +305,13 @@ pub const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
 
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
+pub const GWL_STYLE: i32 = -16;
+pub const GWL_EXSTYLE: i32 = -20;
+
 pub const WS_OVERLAPPED: u32 = 0x0000_0000;
 pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_CAPTION: u32 = 0x00C0_0000;
+pub const WS_THICKFRAME: u32 = 0x0004_0000;
 pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
 pub const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
 pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
@@ -319,19 +324,29 @@ pub const SW_HIDE: i32 = 0;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
+pub const SWP_NOZORDER: u32 = 0x0004;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
+pub const SWP_SHOWWINDOW: u32 = 0x0040;
+pub const SWP_HIDEWINDOW: u32 = 0x0080;
+pub const SWP_NOOWNERZORDER: u32 = 0x0200;
+pub const LWA_ALPHA: u32 = 0x0000_0002;
 pub const ULW_ALPHA: u32 = 0x0000_0002;
 
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
 pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
+pub const WM_MOUSEACTIVATE: u32 = 0x0021;
 pub const WM_DISPLAYCHANGE: u32 = 0x007E;
+pub const WM_NCHITTEST: u32 = 0x0084;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_POWERBROADCAST: u32 = 0x0218;
 pub const WM_DEVICECHANGE: u32 = 0x0219;
 pub const WM_DPICHANGED: u32 = 0x02E0;
+pub const MA_NOACTIVATE: isize = 3;
+pub const HTTRANSPARENT: isize = -1;
 pub const PBT_APMRESUMESUSPEND: usize = 0x0007;
 pub const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 
@@ -339,7 +354,10 @@ pub const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
 pub const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
 pub const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
 pub const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+pub const EVENT_OBJECT_REORDER: u32 = 0x8004;
 pub const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+pub const OBJID_WINDOW: i32 = 0;
+pub const OBJID_CLIENT: i32 = -4;
 pub const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 pub const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 
@@ -484,9 +502,12 @@ extern "system" {
         window_name: *const u16,
     ) -> HWND;
     pub fn GetWindowRect(hwnd: HWND, rc: *mut RECT) -> BOOL;
+    pub fn GetDesktopWindow() -> HWND;
     pub fn IsWindow(hwnd: HWND) -> BOOL;
     pub fn IsWindowVisible(hwnd: HWND) -> BOOL;
+    pub fn IsIconic(hwnd: HWND) -> BOOL;
     pub fn IsZoomed(hwnd: HWND) -> BOOL;
+    pub fn GetWindowLongW(hwnd: HWND, index: i32) -> i32;
     pub fn ShowWindow(hwnd: HWND, cmd: i32) -> BOOL;
     pub fn SetWindowPos(
         hwnd: HWND,
@@ -503,6 +524,12 @@ extern "system" {
     pub fn GetClassNameW(hwnd: HWND, buf: *mut u16, max_count: i32) -> i32;
     pub fn GetDC(hwnd: HWND) -> HDC;
     pub fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
+    pub fn GetLayeredWindowAttributes(
+        hwnd: HWND,
+        pcr_key: *mut COLORREF,
+        pb_alpha: *mut u8,
+        pdw_flags: *mut u32,
+    ) -> BOOL;
     pub fn UpdateLayeredWindow(
         hwnd: HWND,
         hdc_dst: HDC,

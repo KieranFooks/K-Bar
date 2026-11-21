@@ -10,15 +10,10 @@
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use windows::core::{Error, GUID, HRESULT, PCWSTR, PWSTR};
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
-};
+use windows::core::{Error, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Devices::HumanInterfaceDevice::{
-    HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetPreparsedData, HidD_GetProductString,
-    HidD_SetFeature, HidP_GetCaps, HIDD_ATTRIBUTES, HIDP_CAPS, PHIDP_PREPARSED_DATA,
+    HidD_FreePreparsedData, HidD_GetPreparsedData, HidD_GetProductString, HidD_SetFeature,
+    HidP_GetCaps, HIDP_CAPS, PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
@@ -29,8 +24,11 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::UI::Input::{
+    GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RIDI_DEVICEINFO,
+    RIDI_DEVICENAME, RID_DEVICE_INFO, RIM_TYPEHID,
+};
 
-const GUID_DEVINTERFACE_HID: GUID = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
 const ERR_WAIT_TIMEOUT: i32 = 0x800704C7u32 as i32;
 const ERR_PROTOCOL: i32 = 0x8007001Fu32 as i32;
 
@@ -460,6 +458,88 @@ struct HyperXEndpoint {
     in_len: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct RawHidDevice {
+    pub path: String,
+    pub vid: u16,
+    pub pid: u16,
+    pub usage_page: u16,
+    pub usage: u16,
+}
+
+/// Enumerate present Raw Input HID interfaces via `user32.dll` (avoids loading `setupapi.dll`).
+pub fn enumerate_raw_hid() -> Vec<RawHidDevice> {
+    unsafe {
+        let elem_size = std::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
+        let mut count = 0u32;
+        if GetRawInputDeviceList(None, &mut count, elem_size) == u32::MAX || count == 0 {
+            return Vec::new();
+        }
+
+        let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize];
+        let got = GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, elem_size);
+        if got == u32::MAX {
+            return Vec::new();
+        }
+        list.truncate(got as usize);
+
+        let mut out = Vec::new();
+        for item in list {
+            if item.dwType != RIM_TYPEHID {
+                continue;
+            }
+
+            let mut info = RID_DEVICE_INFO {
+                cbSize: std::mem::size_of::<RID_DEVICE_INFO>() as u32,
+                ..Default::default()
+            };
+            let mut info_sz = info.cbSize;
+            if GetRawInputDeviceInfoW(
+                Some(item.hDevice),
+                RIDI_DEVICEINFO,
+                Some(&mut info as *mut RID_DEVICE_INFO as *mut c_void),
+                &mut info_sz,
+            ) == u32::MAX
+            {
+                continue;
+            }
+            let hid_info = info.Anonymous.hid;
+
+            let mut char_len = 0u32;
+            if GetRawInputDeviceInfoW(Some(item.hDevice), RIDI_DEVICENAME, None, &mut char_len)
+                == u32::MAX
+                || char_len == 0
+            {
+                continue;
+            }
+            let mut wbuf = vec![0u16; char_len as usize];
+            if GetRawInputDeviceInfoW(
+                Some(item.hDevice),
+                RIDI_DEVICENAME,
+                Some(wbuf.as_mut_ptr() as *mut c_void),
+                &mut char_len,
+            ) == u32::MAX
+            {
+                continue;
+            }
+            let end = wbuf.iter().position(|&c| c == 0).unwrap_or(wbuf.len());
+            let path = String::from_utf16_lossy(&wbuf[..end]);
+            if path.is_empty() {
+                continue;
+            }
+
+            out.push(RawHidDevice {
+                path,
+                vid: hid_info.dwVendorId as u16,
+                pid: hid_info.dwProductId as u16,
+                usage_page: hid_info.usUsagePage,
+                usage: hid_info.usUsage,
+            });
+        }
+        out
+    }
+}
+
 /// Stateful HID battery scanner that caches discovered device interfaces and
 /// feature indices so routine polls only exchange 1-3 packets (~15 ms total).
 #[derive(Default)]
@@ -497,7 +577,7 @@ impl HidScanner {
                         });
                     }
                     // If the receiver opened fine but the mouse didn't answer, it is asleep:
-                    // keep `self.logitech` cached and let UI keep the last value marked `online: false`.
+                    // keep `self.logitech` cached and let UI preserve its last reading.
                     let _ = CloseHandle(h);
                 } else {
                     self.logitech = None;
@@ -516,7 +596,7 @@ impl HidScanner {
             }
         }
 
-        // 3. Discover any missing device kind via SetupAPI
+        // 3. Discover any missing device kind via Raw Input
         if self.logitech.is_none() || self.hyperx.is_none() {
             unsafe { self.discover_missing(&mut results) };
         }
@@ -526,75 +606,34 @@ impl HidScanner {
     }
 
     unsafe fn discover_missing(&mut self, results: &mut Vec<Battery>) {
-        let hdev = match SetupDiGetClassDevsW(
-            Some(&GUID_DEVINTERFACE_HID as *const GUID),
-            PCWSTR::null(),
-            None,
-            DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
-        ) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-
-        let mut index: u32 = 0;
-        while self.logitech.is_none() || self.hyperx.is_none() {
-            let mut ifdata = SP_DEVICE_INTERFACE_DATA {
-                cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
-                ..Default::default()
-            };
-            if SetupDiEnumDeviceInterfaces(
-                hdev,
-                None,
-                &GUID_DEVINTERFACE_HID as *const GUID,
-                index,
-                &mut ifdata,
+        let mut candidates = enumerate_raw_hid();
+        candidates.retain(|d| {
+            (self.logitech.is_none() && d.vid == 0x046D && d.usage_page == 0xFF00)
+                || (self.hyperx.is_none()
+                    && d.vid == 0x03F0
+                    && d.pid == 0x05B7
+                    && d.usage_page == 0xFF13)
+        });
+        // Probe single-device LIGHTSPEED receivers & HID++ 2.0 (usage 0x0002) first.
+        candidates.sort_by_key(|d| {
+            let is_single_lightspeed = matches!(
+                d.pid,
+                0xC539 | 0xC53A | 0xC53F | 0xC541 | 0xC545 | 0xC547
+            );
+            (
+                u8::from(!is_single_lightspeed),
+                u8::from(d.usage != 0x0002),
             )
-            .is_err()
-            {
+        });
+
+        for dev in candidates {
+            if self.logitech.is_some() && self.hyperx.is_some() {
                 break;
             }
-            index += 1;
 
-            let mut required: u32 = 0;
-            let _ = SetupDiGetDeviceInterfaceDetailW(
-                hdev,
-                &ifdata,
-                None,
-                0,
-                Some(&mut required),
-                None,
-            );
-            if required == 0 {
-                continue;
-            }
-            let mut buf = vec![0u8; required as usize];
-            let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
-            (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
-            if SetupDiGetDeviceInterfaceDetailW(
-                hdev,
-                &ifdata,
-                Some(detail),
-                required,
-                Some(&mut required),
-                None,
-            )
-            .is_err()
-            {
-                continue;
-            }
-            let path = PWSTR((*detail).DevicePath.as_ptr() as *mut u16)
-                .to_string()
-                .unwrap_or_default();
-
-            let Some(handle) = open_hid(&path) else {
+            let Some(handle) = open_hid(&dev.path) else {
                 continue;
             };
-
-            let mut attr = HIDD_ATTRIBUTES {
-                Size: std::mem::size_of::<HIDD_ATTRIBUTES>() as u32,
-                ..Default::default()
-            };
-            HidD_GetAttributes(handle, &mut attr);
 
             let mut caps = HIDP_CAPS::default();
             let mut preparsed = PHIDP_PREPARSED_DATA::default();
@@ -603,17 +642,14 @@ impl HidScanner {
                 HidD_FreePreparsedData(preparsed);
             }
 
-            let vid = attr.VendorID;
-            let pid = attr.ProductID;
-
             if self.logitech.is_none()
-                && vid == 0x046D
-                && caps.UsagePage == 0xFF00
+                && dev.vid == 0x046D
+                && dev.usage_page == 0xFF00
                 && caps.OutputReportByteLength == 20
             {
                 let in_len = caps.InputReportByteLength as usize;
                 let product = read_product_string(handle);
-                let indices = logitech_dev_indices(pid);
+                let indices = logitech_dev_indices(dev.pid);
                 let ping_timeout = if indices.len() == 1 { 250 } else { 120 };
 
                 for &dev_idx in indices {
@@ -636,7 +672,7 @@ impl HidScanner {
                         &product,
                     );
                     let ep = LogitechEndpoint {
-                        path: path.clone(),
+                        path: dev.path.clone(),
                         dev_idx,
                         name: name.clone(),
                         batt_feat_id,
@@ -658,9 +694,9 @@ impl HidScanner {
                     }
                 }
             } else if self.hyperx.is_none()
-                && vid == 0x03F0
-                && pid == 0x05B7
-                && caps.UsagePage == 0xFF13
+                && dev.vid == 0x03F0
+                && dev.pid == 0x05B7
+                && dev.usage_page == 0xFF13
             {
                 let out_len = if caps.OutputReportByteLength > 0 {
                     caps.OutputReportByteLength as usize
@@ -680,7 +716,7 @@ impl HidScanner {
                 };
                 if let Some(b) = hyperx_read_handle(handle, out_len, in_len, &name) {
                     self.hyperx = Some(HyperXEndpoint {
-                        path,
+                        path: dev.path,
                         name,
                         out_len,
                         in_len,
@@ -691,8 +727,6 @@ impl HidScanner {
 
             let _ = CloseHandle(handle);
         }
-
-        let _ = SetupDiDestroyDeviceInfoList(hdev);
     }
 }
 

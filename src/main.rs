@@ -1,21 +1,19 @@
-//! Battery Tray — lightweight native Windows 11 taskbar utility showing
-//! battery levels of wireless peripherals (Logitech mouse, HyperX headset).
+//! Battery Tray — ultra-lightweight single-threaded Windows 11 taskbar utility
+//! displaying battery levels of wireless peripherals (Logitech mouse, HyperX headset).
 //!
-//! Renders as a unified 2-line monochrome block directly on the Windows 11
-//! taskbar (Option 1A) using per-pixel alpha (`UpdateLayeredWindow`), auto-hides
-//! in fullscreen apps, supports horizontal drag-to-adjust, and opens a native
-//! Windows 11 flyout on click.
+//! Renders as a passive, click-through unified 2-line monochrome block directly on the
+//! Windows 11 taskbar using per-pixel alpha (`UpdateLayeredWindow`), auto-hides in
+//! fullscreen apps, and polls HID hardware every 45 s plus on USB plug/resume events.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::OnceLock;
 
 use battery_tray::{
-    hid, light_theme, load_offset_x_dip, merge_devices, popup, widget, App, STATE, WM_REFRESH_NOW,
-    WM_SHOW_POPUP, WM_SYNC_WIDGET, WM_UPDATE,
+    hid, light_theme, merge_devices, widget, WM_POLL_NOW, WM_SYNC_WIDGET,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -28,35 +26,68 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
-    KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, EVENT_SYSTEM_FOREGROUND, MSG,
     PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_POWERBROADCAST,
     WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
+const POLL_TIMER_ID: usize = 100;
 const DEVICECHANGE_DEBOUNCE_TIMER_ID: usize = 101;
 const WIDGET_SYNC_TIMER_ID: usize = 102;
-const POLL_INTERVAL: Duration = Duration::from_secs(45);
+const POLL_INTERVAL_MS: u32 = 45_000;
 
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
-static WORKER_SIGNAL: OnceLock<Arc<(Mutex<WorkerSignal>, Condvar)>> = OnceLock::new();
 static MAIN_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Default)]
-struct WorkerSignal {
-    wake: bool,
-    force_rescan: bool,
-    shutdown: bool,
+struct AppState {
+    main: HWND,
+    widget: Option<HWND>,
+    scanner: Option<hid::HidScanner>,
+    devices: Vec<hid::Battery>,
+    light_theme: bool,
 }
 
-fn wake_worker(force_rescan: bool) {
-    if let Some(pair) = WORKER_SIGNAL.get() {
-        let mut s = pair.0.lock().unwrap();
-        s.wake = true;
-        s.force_rescan |= force_rescan;
-        pair.1.notify_one();
+thread_local! {
+    static APP: RefCell<Option<AppState>> = const { RefCell::new(None) };
+}
+
+unsafe fn sync_widget(force_redraw: bool) {
+    let snapshot = APP.with(|cell| {
+        let borrow = cell.borrow();
+        let state = borrow.as_ref()?;
+        let widget = state.widget?;
+        Some((state.main, widget, state.devices.clone(), state.light_theme))
+    });
+    if let Some((main, widget, devices, light)) = snapshot {
+        widget::sync_position(main, widget, &devices, light, force_redraw);
+    }
+}
+
+unsafe fn run_poll(force_rescan: bool) {
+    let taken = APP.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        borrow.as_mut().and_then(|s| s.scanner.take())
+    });
+    let Some(mut scanner) = taken else { return };
+
+    let fresh = scanner.poll(force_rescan);
+    #[cfg(debug_assertions)]
+    eprintln!("[poll] {fresh:?}");
+
+    let snapshot = APP.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = borrow.as_mut()?;
+        state.scanner = Some(scanner);
+        state.devices = merge_devices(&state.devices, fresh);
+        let widget = state.widget?;
+        Some((state.main, widget, state.devices.clone(), state.light_theme))
+    });
+
+    if let Some((main, widget, devices, light)) = snapshot {
+        widget::sync_position(main, widget, &devices, light, true);
     }
 }
 
@@ -82,48 +113,28 @@ unsafe extern "system" fn win_event_proc(
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_UPDATE => {
-            let fresh = Box::from_raw(lp.0 as *mut Vec<hid::Battery>);
-            {
-                let mut g = STATE.0.lock().unwrap();
-                if let Some(a) = g.as_mut() {
-                    a.devices = merge_devices(&a.devices, *fresh);
-                }
-            }
-            widget::sync_position(true);
-            popup::refresh_if_open();
+        WM_POLL_NOW => {
+            run_poll(true);
             LRESULT(0)
         }
         WM_SYNC_WIDGET | WM_DISPLAYCHANGE => {
-            widget::sync_position(msg == WM_DISPLAYCHANGE);
-            LRESULT(0)
-        }
-        WM_SHOW_POPUP => {
-            popup::open(hwnd);
-            LRESULT(0)
-        }
-        WM_REFRESH_NOW => {
-            wake_worker(true);
+            sync_widget(msg == WM_DISPLAYCHANGE);
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
             let light = light_theme();
-            let changed = {
-                let mut g = STATE.0.lock().unwrap();
-                if let Some(a) = g.as_mut() {
-                    if a.light_theme != light {
-                        a.light_theme = light;
-                        true
-                    } else {
-                        false
+            let changed = APP.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                if let Some(state) = borrow.as_mut() {
+                    if state.light_theme != light {
+                        state.light_theme = light;
+                        return true;
                     }
-                } else {
-                    false
                 }
-            };
+                false
+            });
             if changed {
-                widget::sync_position(true);
-                popup::refresh_if_open();
+                sync_widget(true);
             }
             LRESULT(0)
         }
@@ -133,39 +144,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER if wp.0 == DEVICECHANGE_DEBOUNCE_TIMER_ID => {
             let _ = KillTimer(Some(hwnd), DEVICECHANGE_DEBOUNCE_TIMER_ID);
-            wake_worker(true);
+            run_poll(true);
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == POLL_TIMER_ID => {
+            run_poll(false);
             LRESULT(0)
         }
         WM_TIMER if wp.0 == WIDGET_SYNC_TIMER_ID => {
-            widget::sync_position(false);
+            sync_widget(false);
             LRESULT(0)
         }
         WM_POWERBROADCAST => {
             let ev = wp.0 as u32;
             if ev == PBT_APMRESUMEAUTOMATIC || ev == PBT_APMRESUMESUSPEND {
-                wake_worker(true);
+                run_poll(true);
             }
             LRESULT(0)
         }
         WM_CLOSE => {
+            let _ = KillTimer(Some(hwnd), POLL_TIMER_ID);
             let _ = KillTimer(Some(hwnd), DEVICECHANGE_DEBOUNCE_TIMER_ID);
             let _ = KillTimer(Some(hwnd), WIDGET_SYNC_TIMER_ID);
 
-            let popup_hwnd = {
-                let mut g = STATE.0.lock().unwrap();
-                g.as_mut().and_then(|a| a.popup.take())
-            };
-            if let Some(p) = popup_hwnd {
-                let _ = DestroyWindow(p);
-            }
-
-            widget::destroy();
-
-            if let Some(pair) = WORKER_SIGNAL.get() {
-                let mut s = pair.0.lock().unwrap();
-                s.shutdown = true;
-                s.wake = true;
-                pair.1.notify_one();
+            let widget_hwnd = APP.with(|cell| {
+                let state = cell.borrow_mut().take();
+                state.and_then(|s| s.widget)
+            });
+            if let Some(w) = widget_hwnd {
+                widget::destroy(w);
             }
 
             MAIN_HWND_RAW.store(0, Ordering::Relaxed);
@@ -176,7 +183,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         _ => {
             let tbc = *TASKBAR_CREATED.get().unwrap_or(&0);
             if tbc != 0 && msg == tbc {
-                widget::sync_position(true);
+                sync_widget(true);
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wp, lp)
@@ -189,8 +196,6 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let show_popup_flag = std::env::args().any(|a| a == "--show-popup");
-
     let instance_mutex = unsafe {
         match CreateMutexW(None, false, w!("Local\\BatteryTray.SingleInstance")) {
             Ok(m) => m,
@@ -199,9 +204,6 @@ fn main() {
     };
     unsafe {
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Ok(existing) = FindWindowW(w!("BatteryTrayMainClass"), PCWSTR::null()) {
-                let _ = PostMessageW(Some(existing), WM_SHOW_POPUP, WPARAM(0), LPARAM(0));
-            }
             let _ = CloseHandle(instance_mutex);
             return;
         }
@@ -250,21 +252,20 @@ fn main() {
 
         MAIN_HWND_RAW.store(hwnd.0 as usize, Ordering::Relaxed);
         let light = light_theme();
-        let offset_x_dip = load_offset_x_dip();
+        let widget_hwnd = widget::create();
 
-        *STATE.0.lock().unwrap() = Some(App {
-            main: Some(hwnd),
-            widget: None,
-            popup: None,
-            popup_closed_at: None,
-            devices: Vec::new(),
-            light_theme: light,
-            offset_x_dip,
+        APP.with(|cell| {
+            *cell.borrow_mut() = Some(AppState {
+                main: hwnd,
+                widget: widget_hwnd,
+                scanner: Some(hid::HidScanner::new()),
+                devices: Vec::new(),
+                light_theme: light,
+            });
         });
-        let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
 
-        let _ = widget::create(hwnd);
-        widget::sync_position(true);
+        let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
+        sync_widget(true);
 
         let fg_hook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
@@ -275,46 +276,9 @@ fn main() {
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
+        SetTimer(Some(hwnd), POLL_TIMER_ID, POLL_INTERVAL_MS, None);
         SetTimer(Some(hwnd), WIDGET_SYNC_TIMER_ID, 1000, None);
-
-        let signal = Arc::new((Mutex::new(WorkerSignal::default()), Condvar::new()));
-        let _ = WORKER_SIGNAL.set(signal.clone());
-
-        let worker_hwnd = hwnd.0 as usize;
-        let worker_handle = std::thread::spawn(move || {
-            let hwnd = HWND(worker_hwnd as *mut c_void);
-            let mut scanner = hid::HidScanner::new();
-            let mut force_rescan = true;
-
-            loop {
-                let devs = scanner.poll(force_rescan);
-                #[cfg(debug_assertions)]
-                eprintln!("[poll] {devs:?}");
-
-                let boxed = Box::into_raw(Box::new(devs));
-                if PostMessageW(Some(hwnd), WM_UPDATE, WPARAM(0), LPARAM(boxed as isize)).is_err()
-                {
-                    drop(Box::from_raw(boxed));
-                    break;
-                }
-
-                let mut guard = signal.0.lock().unwrap();
-                if !guard.wake && !guard.shutdown {
-                    let (g, _) = signal.1.wait_timeout(guard, POLL_INTERVAL).unwrap();
-                    guard = g;
-                }
-                if guard.shutdown {
-                    break;
-                }
-                force_rescan = guard.force_rescan;
-                guard.wake = false;
-                guard.force_rescan = false;
-            }
-        });
-
-        if show_popup_flag {
-            let _ = PostMessageW(Some(hwnd), WM_SHOW_POPUP, WPARAM(0), LPARAM(0));
-        }
+        let _ = PostMessageW(Some(hwnd), WM_POLL_NOW, WPARAM(0), LPARAM(0));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -325,7 +289,6 @@ fn main() {
         if !fg_hook.is_invalid() {
             let _ = UnhookWinEvent(fg_hook);
         }
-        let _ = worker_handle.join();
         let _ = CloseHandle(instance_mutex);
     }
 }

@@ -1,19 +1,19 @@
 # AGENTS.md — Battery Tray
 
 ## Project Goal & Performance Budget
-Lightweight native Windows 11 taskbar utility written in **Rust** (`windows-rs` 0.62) that displays live battery levels and charging state for wireless peripherals in a **single unified 2-line taskbar block** (Option 1A).
+Ultra-lightweight single-threaded native Windows 11 taskbar utility written in **Rust** (`windows-rs` 0.62) that displays live battery levels and charging state for wireless peripherals in a **single passive 2-line monochrome taskbar block**.
 
-- **Memory target**: < 3 MB private working set (`PrivateMemorySize64`).
-- **CPU target**: ~0% idle CPU (100% event-driven Win32 message loop + sleepable `Condvar` HID worker + zero-allocation cached redraws).
+- **Memory target**: Minimal private working set (`PrivateMemorySize64`).
+- **CPU target**: ~0% idle CPU (pure single-threaded Win32 message loop, `WM_TIMER` polling every 45 s, and zero-allocation cached redraws).
+- **Minimal OS footprint**: Uses only core Win32 DLLs (`user32`, `gdi32`, `hid`, `advapi32`, `kernel32`). Avoids loading `setupapi.dll`, `shell32.dll`, `shcore.dll`, and `dwmapi.dll`.
 - **Binary target**: small stripped release executable (`opt-level = "z"`, LTO, `codegen-units = 1`, `panic = "abort"`, `strip = true`).
-- **Zero heavy dependencies**: no webviews, no frameworks, no embedded raster/SVG image assets.
 
 ---
 
 ## Target Hardware & HID Protocols
 
 ### 1. Logitech HID++ 2.0 Mice (G502 LIGHTSPEED, Unifying / Bolt / Direct USB)
-- **Interface filter**: `VID == 0x046D`, `UsagePage == 0xFF00`, `OutputReportByteLength == 20` (long HID++ 2.0 reports, `0x11`). Ignore 32-byte or 7-byte sibling interfaces so discovery never stalls.
+- **Discovery**: Raw Input enumeration (`GetRawInputDeviceList` + `GetRawInputDeviceInfoW` via `user32.dll`), filtered to `VID == 0x046D`, `UsagePage == 0xFF00`, and `OutputReportByteLength == 20` (long HID++ 2.0 reports, `0x11`). Single-device LIGHTSPEED receivers (`0xC539` etc.) and `usage == 0x0002` are prioritized before multi-device receivers (`0xC52B`).
 - **Software ID (`sw_id`)**: Always send a non-zero `sw_id` (`0x0A`) in `buf[3] = (func << 4) | SW_ID`. Filter incoming packets strictly by `(report_id == 0x11, dev_idx, feat_idx, func, sw_id)` or HID++ error frames (`0xFF` / `0x8F`) to avoid desync with background traffic from **Logitech G HUB** or unsolicited `sw_id == 0` notifications.
 - **Device indices**:
   - Single-device LIGHTSPEED receivers (`0xC539`, `0xC53A`, `0xC53F`, `0xC541`, `0xC545`, `0xC547`): probe `dev_idx = 1` first.
@@ -28,29 +28,27 @@ Lightweight native Windows 11 taskbar utility written in **Rust** (`windows-rs` 
 ### 2. HyperX Cloud III Wireless (`VID 0x03F0`, `PID 0x05B7`)
 - **Interface filter**: `UsagePage == 0xFF13`, `in = 62`, `out = 62`.
 - **Packets**: Report ID `0x66`, command byte at `buf[1]`. Fallback to `HidD_SetFeature` if `WriteFile` fails. Validate incoming packets with `r.len() >= 5 && r[0] == 0x66 && r[1] == cmd`.
-- **Battery (`0x89`)**: If `r[2] == 0 && r[3] == 0`, the headset is **powered off / offline** (`pct: None`, `online: false`). Otherwise `pct = Some(r[4].min(100))`, `online = true`.
+- **Battery (`0x89`)**: If `r[2] == 0 && r[3] == 0`, the headset is powered off (`pct: None`, `online: false`). Otherwise `pct = Some(r[4].min(100))`, `online = true`.
 - **Charging (`0x8A`)**: Query only when online; `charging = r[2] != 0`.
 
 ---
 
-## UI / UX Architecture (Option 1A — Unified Taskbar Block)
-- **100% Microsoft Windows 11 native look**: uses system fonts **`Segoe Fluent Icons`** (fallback `Segoe MDL2 Assets`) and **`Segoe UI`** — no third-party icon packs or flashy colors.
-- **Strict monochrome integration**: light glyphs/text on dark taskbars, dark glyphs/text on light taskbars, driven by `HKCU\...\Personalize\SystemUsesLightTheme` and live `WM_SETTINGCHANGE` updates.
-- **Unified 2-line taskbar block (`src/widget.rs`)**:
-  - Single `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST` `WS_POPUP` window rendered with `UpdateLayeredWindow` (premultiplied 32bpp BGRA).
-  - Positioned cleanly to the left of `TrayNotifyWnd` on `Shell_TrayWnd`, matching the Windows 11 Clock block height (`38` DIPs centered in the `48`-DIP taskbar) with subtle rounded hover/active pill highlights.
-  - **Fullscreen auto-hide**: hides automatically when `SHQueryUserNotificationState` reports `QUNS_RUNNING_D3D_FULL_SCREEN`, when the taskbar auto-hides, or when an opaque foreground window covers the full monitor (`EVENT_SYSTEM_FOREGROUND` hook + lightweight 1 s check).
-  - **Horizontal drag-to-adjust**: users can drag the block horizontally along the taskbar; the offset (`OffsetX`) persists in `HKCU\Software\BatteryTray` and can be reset from the flyout (`Réinitialiser la position`).
-- **Native Windows 11 flyout (`src/popup.rs`)**: DWM rounded corners (`DWMWCP_ROUND`), DWM immersive dark/light mode & border color, Per-Monitor DPI scaling (`GetDpiForWindow`), double-buffered GDI paint, anchored directly above the taskbar block, dismisses on outside click (`WA_INACTIVE`) and `Escape`, and includes **Actualiser**, **Lancer au démarrage** (`HKCU\...\Run`), optional **Réinitialiser la position**, and **Quitter**.
+## UI / UX Architecture (Passive Unified Taskbar Block)
+- **100% Microsoft Windows 11 native look**: uses system fonts **`Segoe Fluent Icons`** (fallback `Segoe MDL2 Assets`) and **`Segoe UI`** — no third-party icon packs, no flashy colors, no popup menu.
+- **Strict uniform monochrome integration**: light glyphs/text on dark taskbars, dark glyphs/text on light taskbars, driven by `HKCU\...\Personalize\SystemUsesLightTheme` and live `WM_SETTINGCHANGE` updates. All rows render at uniform opacity (no dimming when sleeping).
+- **Passive click-through taskbar block (`src/widget.rs`)**:
+  - Single `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST` `WS_POPUP` window rendered with `UpdateLayeredWindow` (premultiplied 32bpp BGRA).
+  - Positioned cleanly to the left of `TrayNotifyWnd` on `Shell_TrayWnd`, matching the Windows 11 Clock block height (`38` DIPs centered in the `48`-DIP taskbar).
+  - **Fullscreen auto-hide**: hides automatically when the taskbar auto-hides or when an opaque foreground window covers the full monitor (`EVENT_SYSTEM_FOREGROUND` hook + lightweight 1 s check, using only `user32.dll`).
 
 ---
 
 ## Critical Win32 & Concurrency Invariants
 1. **Never use `HWND_MESSAGE` for the main hidden window**: Windows does **not** deliver broadcast messages (`WM_SETTINGCHANGE`, `TaskbarCreated`, `WM_DEVICECHANGE`, `WM_POWERBROADCAST`) to message-only windows. Always create a hidden top-level window (`parent = None`, `WS_EX_TOOLWINDOW`, never shown).
-2. **Never hold `STATE.0` mutex across Win32 window/message calls**: Calling `DestroyWindow` or `SendMessageW` while locking `STATE.0` causes an immediate deadlock when `WM_DESTROY` or another handler locks `STATE.0`. Snapshot state, drop the lock, then call Win32.
+2. **Never hold `RefCell` borrows across Win32 calls or `scanner.poll()`**: Snapshot state/take scanner, drop borrow, then run HID I/O or `widget::sync_position`.
 3. **Always retire cancelled overlapped HID I/O**: After `CancelIoEx(h, Some(&ov))`, call `GetOverlappedResult(h, &ov, &mut got, true)` before closing the event handle or dropping the buffer so the kernel cannot write into freed stack/heap memory.
 4. **Never use ClearType or luminance-to-alpha**: Always render text/glyphs white-on-black with `ANTIALIASED_QUALITY` (grayscale coverage, zero ClearType RGB fringes), composite straight RGBA layers, and convert via `rgba_to_premul_bgra` before `UpdateLayeredWindow`.
-5. **Zero handle leaks**: Every `CreateEventW`, `CreateCompatibleDC`, `CreateDIBSection`/`CreateCompatibleBitmap`, `CreateFontW`, `CreateSolidBrush`, `CreatePen`, and `HWINEVENTHOOK` must restore previous DC selections and be destroyed (`DeleteObject`/`DeleteDC`/`ReleaseDC`/`CloseHandle`/`UnhookWinEvent`).
+5. **Zero handle leaks**: Every `CreateEventW`, `CreateCompatibleDC`, `CreateDIBSection`, `CreateFontW`, and `HWINEVENTHOOK` must restore previous DC selections and be destroyed (`DeleteObject`/`DeleteDC`/`ReleaseDC`/`CloseHandle`/`UnhookWinEvent`).
 
 ---
 
@@ -72,6 +70,6 @@ cargo build --release
 # Live HID hardware probe (does not launch GUI)
 cargo run --bin poc
 
-# Render Option 1A taskbar block contact sheet for visual verification
+# Render taskbar block contact sheet for visual verification
 cargo run --bin glyphtest -- target\widget_preview.bmp
 ```

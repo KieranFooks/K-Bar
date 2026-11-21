@@ -10,17 +10,12 @@ use battery_tray::hid::{
     self, hidpp_request, parse_1000_status, parse_1001_voltage, parse_1004_status,
     parse_hyperx_battery, parse_hyperx_charging,
 };
-use windows::core::{Error, GUID, HRESULT, PCWSTR, PWSTR, Result};
+use windows::core::{Error, HRESULT, PCWSTR, PWSTR, Result};
 use windows::Devices::Enumeration::DeviceInformation;
 use windows::Devices::Power::Battery;
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
-};
 use windows::Win32::Devices::HumanInterfaceDevice::{
-    HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetPreparsedData, HidD_GetProductString,
-    HidD_SetFeature, HidP_GetCaps, HIDD_ATTRIBUTES, HIDP_CAPS, PHIDP_PREPARSED_DATA,
+    HidD_FreePreparsedData, HidD_GetPreparsedData, HidD_GetProductString, HidD_SetFeature,
+    HidP_GetCaps, HIDP_CAPS, PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
@@ -31,8 +26,6 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-
-const GUID_DEVINTERFACE_HID: GUID = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
 
 fn hex(buf: &[u8]) -> String {
     buf.iter()
@@ -234,65 +227,14 @@ unsafe fn probe_hyperx(h: HANDLE, out_len: usize, in_len: usize, product: &str) 
 }
 
 unsafe fn raw_hid_scan() {
-    println!("\n=== Raw HID scan ===");
-    let Ok(hdev) = SetupDiGetClassDevsW(
-        Some(&GUID_DEVINTERFACE_HID as *const GUID),
-        PCWSTR::null(),
-        None,
-        DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
-    ) else {
-        return;
-    };
-
-    let mut index: u32 = 0;
-    loop {
-        let mut ifdata = SP_DEVICE_INTERFACE_DATA {
-            cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
-            ..Default::default()
-        };
-        if SetupDiEnumDeviceInterfaces(
-            hdev,
-            None,
-            &GUID_DEVINTERFACE_HID as *const GUID,
-            index,
-            &mut ifdata,
-        )
-        .is_err()
-        {
-            break;
-        }
-        index += 1;
-
-        let mut required = 0u32;
-        let _ = SetupDiGetDeviceInterfaceDetailW(hdev, &ifdata, None, 0, Some(&mut required), None);
-        if required == 0 {
+    println!("\n=== Raw HID scan (Raw Input) ===");
+    for dev in hid::enumerate_raw_hid() {
+        let is_logitech = dev.vid == 0x046D && dev.usage_page == 0xFF00;
+        let is_hyperx = dev.vid == 0x03F0 && dev.pid == 0x05B7 && dev.usage_page == 0xFF13;
+        if !is_logitech && !is_hyperx {
             continue;
         }
-        let mut buf = vec![0u8; required as usize];
-        let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
-        (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
-        if SetupDiGetDeviceInterfaceDetailW(
-            hdev,
-            &ifdata,
-            Some(detail),
-            required,
-            Some(&mut required),
-            None,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        let path = PWSTR((*detail).DevicePath.as_ptr() as *mut u16)
-            .to_string()
-            .unwrap_or_default();
-        let Some(h) = open_hid(&path) else { continue };
-
-        let mut attr = HIDD_ATTRIBUTES {
-            Size: std::mem::size_of::<HIDD_ATTRIBUTES>() as u32,
-            ..Default::default()
-        };
-        HidD_GetAttributes(h, &mut attr);
+        let Some(h) = open_hid(&dev.path) else { continue };
 
         let mut product = [0u16; 256];
         let _ = HidD_GetProductString(
@@ -309,16 +251,15 @@ unsafe fn raw_hid_scan() {
             HidD_FreePreparsedData(preparsed);
         }
 
-        if attr.VendorID == 0x046D && caps.UsagePage == 0xFF00 && caps.OutputReportByteLength == 20 {
-            probe_logitech(h, caps.InputReportByteLength as usize, attr.ProductID, &product);
-        } else if attr.VendorID == 0x03F0 && attr.ProductID == 0x05B7 && caps.UsagePage == 0xFF13 {
+        if is_logitech && caps.OutputReportByteLength == 20 {
+            probe_logitech(h, caps.InputReportByteLength as usize, dev.pid, &product);
+        } else if is_hyperx {
             let out_len = (caps.OutputReportByteLength as usize).max(62);
             let in_len = (caps.InputReportByteLength as usize).max(62);
             probe_hyperx(h, out_len, in_len, &product);
         }
         let _ = CloseHandle(h);
     }
-    let _ = SetupDiDestroyDeviceInfoList(hdev);
 }
 
 fn main() {

@@ -1,8 +1,8 @@
 //! Shared Fluent glyph constants, grayscale GDI coverage-mask rendering,
-//! SDF geometry, and straight-RGBA / premultiplied-BGRA compositing helpers.
+//! and straight-RGBA / premultiplied-BGRA compositing helpers.
 //!
 //! Uses `ANTIALIASED_QUALITY` (grayscale coverage, zero ClearType RGB fringes)
-//! so both the taskbar block and the flyout stay strictly monochrome.
+//! so the unified taskbar block stays strictly monochrome.
 
 use std::ffi::c_void;
 
@@ -17,37 +17,14 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::hid::Kind;
 
-/// Battery0..Battery10 (empty .. full).
+/// Battery0..Battery10 fallback glyph when no devices are detected.
 pub const BATTERY_BASE: u32 = 0xEBA0;
-/// BatteryCharging0..10 (bolt overlay, empty .. full).
-pub const BATTERY_CHARGING_BASE: u32 = 0xEBAB;
 /// Mouse glyph.
 pub const MOUSE: u32 = 0xE962;
 /// Headphones glyph.
 pub const HEADSET: u32 = 0xE7F6;
 /// Lightning bolt glyph (charging indicator).
 pub const BOLT: u32 = 0xE945;
-/// Refresh / Sync glyph.
-pub const REFRESH: u32 = 0xE72C;
-/// Checkmark glyph.
-pub const CHECK: u32 = 0xE73E;
-/// Undo / Reset position glyph.
-pub const UNDO: u32 = 0xE7A7;
-/// Power glyph.
-pub const POWER: u32 = 0xE7E8;
-
-/// Map a battery level (0-100 %) + charging flag to a Fluent glyph codepoint.
-pub fn battery_glyph(pct: Option<u8>, charging: bool) -> u32 {
-    let lvl = match pct {
-        Some(p) => ((p as u32 + 5) / 10).min(10),
-        None => 0,
-    };
-    if charging {
-        BATTERY_CHARGING_BASE + lvl
-    } else {
-        BATTERY_BASE + lvl
-    }
-}
 
 pub fn kind_glyph(kind: Kind) -> u32 {
     match kind {
@@ -215,27 +192,6 @@ pub(crate) fn composite_px(
     rgba[idx + 3] = out_a.min(255) as u8;
 }
 
-/// Signed distance to an axis-aligned rounded rectangle.
-pub(crate) fn sdf_round_rect(
-    px: f32,
-    py: f32,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    r: f32,
-) -> f32 {
-    let cx = (x0 + x1) * 0.5;
-    let cy = (y0 + y1) * 0.5;
-    let hx = ((x1 - x0) * 0.5 - r).max(0.0);
-    let hy = ((y1 - y0) * 0.5 - r).max(0.0);
-    let dx = (px - cx).abs() - hx;
-    let dy = (py - cy).abs() - hy;
-    let ox = dx.max(0.0);
-    let oy = dy.max(0.0);
-    (ox * ox + oy * oy).sqrt() + dx.max(dy).min(0.0) - r
-}
-
 /// Convert straight RGBA pixels into premultiplied BGRA (for `UpdateLayeredWindow`).
 pub(crate) fn rgba_to_premul_bgra(rgba: &[u8], dst_bgra: &mut [u8]) {
     for (src, dst) in rgba
@@ -257,11 +213,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn battery_and_kind_glyph_mapping() {
-        assert_eq!(battery_glyph(Some(0), false), BATTERY_BASE);
-        assert_eq!(battery_glyph(Some(86), false), BATTERY_BASE + 9);
-        assert_eq!(battery_glyph(Some(100), true), BATTERY_CHARGING_BASE + 10);
-        assert_eq!(battery_glyph(None, false), BATTERY_BASE);
+    fn kind_glyph_mapping() {
         assert_eq!(kind_glyph(Kind::Mouse), MOUSE);
         assert_eq!(kind_glyph(Kind::Headset), HEADSET);
     }

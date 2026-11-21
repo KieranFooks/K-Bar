@@ -1,5 +1,5 @@
-//! Debug helper: render the unified 2-line taskbar block (Option 1A) over dark
-//! and light Windows 11 taskbar backgrounds at 96 DPI and 144 DPI (1x and 3x).
+//! Debug helper: render the unified 2-line taskbar block over dark and light
+//! Windows 11 taskbar backgrounds at 96 DPI and 144 DPI (1x and 2x zoom).
 //! Usage: glyphtest.exe [output.bmp]
 
 use battery_tray::{
@@ -56,12 +56,6 @@ fn write_bmp(path: &str, width: usize, height: usize, rgb: &[u8]) {
     std::fs::write(path, out).expect("write bmp");
 }
 
-struct Case {
-    devices: Vec<Battery>,
-    hovered: bool,
-    active: bool,
-}
-
 fn dev(kind: Kind, pct: Option<u8>, charging: bool, online: bool) -> Battery {
     Battery {
         name: "Device".to_string(),
@@ -77,37 +71,11 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "widget_preview.bmp".to_string());
 
-    let cases = [
-        Case {
-            devices: vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
-            hovered: false,
-            active: false,
-        },
-        Case {
-            devices: vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
-            hovered: true,
-            active: false,
-        },
-        Case {
-            devices: vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
-            hovered: false,
-            active: true,
-        },
-        Case {
-            devices: vec![dev(Kind::Mouse, Some(100), true, true), dev(Kind::Headset, Some(28), false, true)],
-            hovered: true,
-            active: false,
-        },
-        Case {
-            devices: vec![dev(Kind::Mouse, Some(86), false, false), dev(Kind::Headset, None, false, false)],
-            hovered: false,
-            active: false,
-        },
-        Case {
-            devices: vec![],
-            hovered: true,
-            active: false,
-        },
+    let cases: [Vec<Battery>; 4] = [
+        vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
+        vec![dev(Kind::Mouse, Some(100), true, true), dev(Kind::Headset, Some(28), false, true)],
+        vec![dev(Kind::Mouse, Some(86), false, false), dev(Kind::Headset, None, false, false)],
+        vec![],
     ];
 
     let dpis = [96u32, 144];
@@ -124,7 +92,7 @@ fn main() {
             let row = di * 2 + ti;
             let bg = if light { (0xEF, 0xEF, 0xEF) } else { (0x1F, 0x1B, 0x33) };
 
-            for (col, case) in cases.iter().enumerate() {
+            for (col, devs) in cases.iter().enumerate() {
                 let x0 = col * cell_w;
                 let y0 = row * cell_h;
                 for y in y0..(y0 + cell_h) {
@@ -136,8 +104,7 @@ fn main() {
                     }
                 }
 
-                let (w, h, rgba) =
-                    widget::render_widget_rgba(&case.devices, dpi, light, case.hovered, case.active);
+                let (w, h, rgba) = widget::render_widget_rgba(devs, dpi, light);
                 let wu = w as usize;
                 let hu = h as usize;
 

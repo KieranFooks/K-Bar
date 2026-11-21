@@ -2,6 +2,8 @@
 
 Utilitaire natif Windows 11 ultra-minimaliste écrit en **Rust pur `#![no_std]` + `#![no_main]`** (zéro crate externe, lié avec `-nostdlib`) qui affiche le niveau de batterie des périphériques sans fil (**souris Logitech HID++ 2.0** et **casque HyperX Cloud III Wireless**) dans un bloc monochrome à 2 lignes intégré directement sur la barre des tâches, à côté de l'horloge.
 
+![Aperçu dans la barre des tâches Windows 11](docs/preview.png)
+
 ## Fonctionnement
 
 - **Affichage passif unifié** : bloc transparent aux clics (`WS_EX_TRANSPARENT`), monochrome uniforme sur toutes les lignes, détenu par `Shell_TrayWnd` (zéro clignotement de focus), adapté automatiquement au thème clair/sombre Windows 11 (`WM_SETTINGCHANGE`) et au DPI (`WM_DPICHANGED`).

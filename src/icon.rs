@@ -1,210 +1,140 @@
-//! Shared Fluent glyph constants, grayscale GDI coverage-mask rendering,
-//! and straight-RGBA / premultiplied-BGRA compositing helpers.
-//!
-//! Uses `ANTIALIASED_QUALITY` (grayscale coverage, zero ClearType RGB fringes)
-//! so the unified taskbar block stays strictly monochrome.
+//! Fluent glyph constants, stack UTF-16 percentage formatting, and DPI-cached GDI fonts (`#![no_std]`).
 
-use std::ffi::c_void;
-
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, RECT};
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDC,
-    ReleaseDC, SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO,
-    BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
-    DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, OUT_DEFAULT_PRECIS, TRANSPARENT,
-};
+use core::ptr::null_mut;
 
 use crate::hid::Kind;
+use crate::w;
+use crate::win32::{
+    CreateFontW, DeleteObject, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, HFONT,
+    OUT_DEFAULT_PRECIS,
+};
 
-/// Battery0..Battery10 fallback glyph when no devices are detected.
-pub const BATTERY_BASE: u32 = 0xEBA0;
+/// Battery0 fallback glyph when no devices are detected.
+pub const BATTERY_BASE: u16 = 0xEBA0;
 /// Mouse glyph.
-pub const MOUSE: u32 = 0xE962;
+pub const MOUSE: u16 = 0xE962;
 /// Headphones glyph.
-pub const HEADSET: u32 = 0xE7F6;
+pub const HEADSET: u16 = 0xE7F6;
 /// Lightning bolt glyph (charging indicator).
-pub const BOLT: u32 = 0xE945;
+pub const BOLT: u16 = 0xE945;
 
-pub fn kind_glyph(kind: Kind) -> u32 {
+pub const fn kind_glyph(kind: Kind) -> u16 {
     match kind {
         Kind::Mouse => MOUSE,
         Kind::Headset => HEADSET,
     }
 }
 
-/// Render white text/glyph onto a black 32bpp DIB using `ANTIALIASED_QUALITY`
-/// (grayscale only, zero ClearType RGB fringes) and return a `w * h` 8-bit
-/// coverage mask (`0..=255`).
-///
-/// # Safety
-/// Must be called on a thread with GDI access. All temporary GDI objects are
-/// destroyed before returning.
-pub(crate) unsafe fn render_text_mask_aligned(
-    text: &str,
-    faces: &[&str],
-    w: i32,
-    h: i32,
-    font_height: i32,
-    weight: i32,
-    align: DRAW_TEXT_FORMAT,
-) -> Option<Vec<u8>> {
-    let w = w.max(2);
-    let h = h.max(2);
-    let screen = GetDC(None);
-    let memdc = CreateCompatibleDC(Some(screen));
-
-    let bi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
+/// Format `"86 %"`, `"100 %"`, or `"--"` directly into a stack UTF-16 buffer (no `core::fmt`).
+pub fn format_pct_utf16(pct: Option<u8>, out: &mut [u16; 8]) -> usize {
+    let Some(raw) = pct else {
+        out[0] = b'-' as u16;
+        out[1] = b'-' as u16;
+        return 2;
     };
-
-    let mut bits: *mut c_void = std::ptr::null_mut();
-    let bmp = match CreateDIBSection(Some(memdc), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
-        Ok(b) if !bits.is_null() => b,
-        _ => {
-            let _ = DeleteDC(memdc);
-            ReleaseDC(None, screen);
-            return None;
-        }
+    let p = if raw > 100 { 100 } else { raw };
+    let n = if p == 100 {
+        out[0] = b'1' as u16;
+        out[1] = b'0' as u16;
+        out[2] = b'0' as u16;
+        3
+    } else if p >= 10 {
+        out[0] = (b'0' + p / 10) as u16;
+        out[1] = (b'0' + p % 10) as u16;
+        2
+    } else {
+        out[0] = (b'0' + p) as u16;
+        1
     };
-    std::ptr::write_bytes(bits as *mut u8, 0, (w * h * 4) as usize);
-    let old_bmp = SelectObject(memdc, bmp.into());
-
-    let mut font = None;
-    for face in faces {
-        let face_w: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
-        let f = CreateFontW(
-            font_height,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            0,
-            PCWSTR(face_w.as_ptr()),
-        );
-        if !f.0.is_null() {
-            font = Some(f);
-            break;
-        }
-    }
-
-    let Some(font) = font else {
-        SelectObject(memdc, old_bmp);
-        let _ = DeleteObject(bmp.into());
-        let _ = DeleteDC(memdc);
-        ReleaseDC(None, screen);
-        return None;
-    };
-
-    let old_font = SelectObject(memdc, font.into());
-    SetBkMode(memdc, TRANSPARENT);
-    SetTextColor(memdc, COLORREF(0x00FF_FFFF));
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
-    let mut rc = RECT {
-        left: 0,
-        top: 0,
-        right: w,
-        bottom: h,
-    };
-    DrawTextW(memdc, &mut wide, &mut rc, align);
-
-    let slice = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
-    let mut mask = Vec::with_capacity((w * h) as usize);
-    for px in slice.as_chunks::<4>().0 {
-        let avg = ((px[0] as u16 + px[1] as u16 + px[2] as u16) / 3) as u8;
-        mask.push(avg);
-    }
-
-    SelectObject(memdc, old_font);
-    let _ = DeleteObject(font.into());
-    SelectObject(memdc, old_bmp);
-    let _ = DeleteObject(bmp.into());
-    let _ = DeleteDC(memdc);
-    ReleaseDC(None, screen);
-    Some(mask)
+    out[n] = b' ' as u16;
+    out[n + 1] = b'%' as u16;
+    n + 2
 }
 
-/// Render a centered Fluent icon glyph into a `w * h` 8-bit grayscale mask.
-///
-/// # Safety
-/// Must be called on a thread with GDI access.
-pub(crate) unsafe fn render_glyph_mask(
-    codepoint: u32,
-    w: i32,
-    h: i32,
-    font_px: i32,
-) -> Option<Vec<u8>> {
-    let ch = char::from_u32(codepoint)?;
-    let mut s = [0u8; 4];
-    let text = ch.encode_utf8(&mut s);
-    render_text_mask_aligned(
-        text,
-        &["Segoe Fluent Icons", "Segoe MDL2 Assets"],
-        w,
-        h,
-        -font_px.abs(),
+pub fn scale_dip(dip: i32, dpi: u32) -> i32 {
+    (dip * dpi as i32 + 48) / 96
+}
+
+unsafe fn make_font(height: i32, face: *const u16) -> HFONT {
+    CreateFontW(
+        height,
+        0,
+        0,
+        0,
         400,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY,
+        0,
+        face,
     )
 }
 
-/// Composite `src_rgb` with `alpha` onto straight RGBA pixel at `(x, y)` inside `w x h`.
-pub(crate) fn composite_px(
-    rgba: &mut [u8],
-    w: usize,
-    h: usize,
-    x: i32,
-    y: i32,
-    rgb: (u8, u8, u8),
-    alpha: u8,
-) {
-    if alpha == 0 || x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-        return;
+unsafe fn make_glyph_font(height: i32) -> HFONT {
+    let f = make_font(height, w!("Segoe Fluent Icons"));
+    if !f.is_null() {
+        f
+    } else {
+        make_font(height, w!("Segoe MDL2 Assets"))
     }
-    let idx = (y as usize * w + x as usize) * 4;
-    let dst_a = rgba[idx + 3] as u16;
-    let src_a = alpha as u16;
-    let out_a = src_a + (dst_a * (255 - src_a) + 127) / 255;
-    if out_a == 0 {
-        return;
-    }
-    let dst_weight = (dst_a * (255 - src_a) + 127) / 255;
-    for (c, s) in [rgb.0, rgb.1, rgb.2].into_iter().enumerate() {
-        let num = s as u16 * src_a + rgba[idx + c] as u16 * dst_weight;
-        rgba[idx + c] = ((num + out_a / 2) / out_a).min(255) as u8;
-    }
-    rgba[idx + 3] = out_a.min(255) as u8;
 }
 
-/// Convert straight RGBA pixels into premultiplied BGRA (for `UpdateLayeredWindow`).
-pub(crate) fn rgba_to_premul_bgra(rgba: &[u8], dst_bgra: &mut [u8]) {
-    for (src, dst) in rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(dst_bgra.as_chunks_mut::<4>().0.iter_mut())
-    {
-        let a = src[3] as u16;
-        dst[0] = ((src[2] as u16 * a + 127) / 255) as u8; // B
-        dst[1] = ((src[1] as u16 * a + 127) / 255) as u8; // G
-        dst[2] = ((src[0] as u16 * a + 127) / 255) as u8; // R
-        dst[3] = a as u8;
+pub struct FontCache {
+    pub dpi: u32,
+    pub glyph: HFONT,
+    pub bolt: HFONT,
+    pub text: HFONT,
+}
+
+impl Default for FontCache {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl FontCache {
+    pub const fn empty() -> Self {
+        Self {
+            dpi: 0,
+            glyph: null_mut(),
+            bolt: null_mut(),
+            text: null_mut(),
+        }
+    }
+
+    /// Ensure cached `HFONT`s match `dpi`, recreating only when DPI changes.
+    ///
+    /// # Safety
+    /// Must be called on the UI thread with GDI access.
+    pub unsafe fn ensure_dpi(&mut self, dpi: u32) {
+        if self.dpi == dpi && !self.glyph.is_null() && !self.text.is_null() {
+            return;
+        }
+        self.clear();
+        self.dpi = dpi;
+        self.glyph = make_glyph_font(-scale_dip(11, dpi));
+        self.bolt = make_glyph_font(-scale_dip(10, dpi));
+        self.text = make_font(-scale_dip(12, dpi), w!("Segoe UI"));
+    }
+
+    /// Destroy all cached GDI fonts cleanly.
+    ///
+    /// # Safety
+    /// Must be called on the UI thread when fonts are no longer selected into any DC.
+    pub unsafe fn clear(&mut self) {
+        for f in [self.glyph, self.bolt, self.text] {
+            if !f.is_null() {
+                let _ = DeleteObject(f);
+            }
+        }
+        self.glyph = null_mut();
+        self.bolt = null_mut();
+        self.text = null_mut();
+        self.dpi = 0;
     }
 }
 
@@ -213,41 +143,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kind_glyph_mapping() {
+    fn kind_glyph_and_pct_formatting() {
         assert_eq!(kind_glyph(Kind::Mouse), MOUSE);
         assert_eq!(kind_glyph(Kind::Headset), HEADSET);
-    }
 
-    #[test]
-    fn grayscale_text_and_glyph_masks_produce_nonzero_coverage() {
-        unsafe {
-            let m1 = render_glyph_mask(MOUSE, 16, 16, 12).expect("mouse glyph mask");
-            assert_eq!(m1.len(), 256);
-            assert!(m1.iter().any(|&v| v > 100));
+        let mut buf = [0u16; 8];
+        let to_s = |len: usize, b: &[u16; 8]| String::from_utf16_lossy(&b[..len]);
 
-            let m2 = render_text_mask_aligned(
-                "86 %",
-                &["Segoe UI"],
-                44,
-                16,
-                -12,
-                400,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            )
-            .expect("text mask");
-            assert_eq!(m2.len(), 44 * 16);
-            assert!(m2.iter().any(|&v| v > 100));
-        }
-    }
+        let n = format_pct_utf16(None, &mut buf);
+        assert_eq!(to_s(n, &buf), "--");
 
-    #[test]
-    fn premul_bgra_swaps_channels_and_premultiplies_alpha() {
-        let rgba = [200u8, 100, 50, 128];
-        let mut bgra = [0u8; 4];
-        rgba_to_premul_bgra(&rgba, &mut bgra);
-        assert_eq!(bgra[3], 128);
-        assert_eq!(bgra[2], 100); // R
-        assert_eq!(bgra[1], 50); // G
-        assert_eq!(bgra[0], 25); // B
+        let n = format_pct_utf16(Some(0), &mut buf);
+        assert_eq!(to_s(n, &buf), "0 %");
+
+        let n = format_pct_utf16(Some(86), &mut buf);
+        assert_eq!(to_s(n, &buf), "86 %");
+
+        let n = format_pct_utf16(Some(150), &mut buf);
+        assert_eq!(to_s(n, &buf), "100 %");
     }
 }

@@ -1,13 +1,13 @@
 # Battery Tray
 
-Utilitaire natif Windows 11 minimaliste en Rust qui affiche le niveau de batterie des périphériques sans fil (**souris Logitech HID++ 2.0** et **casque HyperX Cloud III Wireless**) dans un bloc monochrome à 2 lignes intégré directement sur la barre des tâches, à côté de l'horloge.
+Utilitaire natif Windows 11 ultra-minimaliste écrit en **Rust pur `#![no_std]` + `#![no_main]`** (zéro crate externe, lié avec `-nostdlib`) qui affiche le niveau de batterie des périphériques sans fil (**souris Logitech HID++ 2.0** et **casque HyperX Cloud III Wireless**) dans un bloc monochrome à 2 lignes intégré directement sur la barre des tâches, à côté de l'horloge.
 
 ## Fonctionnement
 
-- **Affichage passif unifié** : bloc transparent aux clics (`WS_EX_TRANSPARENT`), monochrome (s'adapte automatiquement au thème clair/sombre Windows 11 via `WM_SETTINGCHANGE`) et à teinte uniforme sur toutes les lignes.
-- **Masquage plein écran** : disparaît automatiquement dès qu'une application ou un jeu passe en plein écran sur le même écran, ou si la barre des tâches est masquée automatiquement.
+- **Affichage passif unifié** : bloc transparent aux clics (`WS_EX_TRANSPARENT`), monochrome uniforme sur toutes les lignes, détenu par `Shell_TrayWnd` (zéro clignotement de focus), adapté automatiquement au thème clair/sombre Windows 11 (`WM_SETTINGCHANGE`).
+- **Masquage plein écran** : piloté par événements (`EVENT_SYSTEM_FOREGROUND`, `MOVESIZEEND`, `MINIMIZE*`, `OBJECT_LOCATIONCHANGE` ciblé sur le thread de la barre des tâches) + garde de 5 s.
 - **Actualisation** : toutes les **45 secondes**, plus immédiatement au branchement/débranchement USB (`WM_DEVICECHANGE`) et à la sortie de veille (`WM_POWERBROADCAST`).
-- **Zéro dépendance lourde** : n'utilise ni WebView, ni `setupapi.dll`, ni `shell32.dll`, ni `shcore.dll`, ni `dwmapi.dll`. Découverte HID via Raw Input (`user32.dll`) et boucle événementielle mono-thread.
+- **Empreinte minimale** : zéro allocation sur le chemin rapide de rendu/synchronisation, un seul DIB GDI par redessin, polices `HFONT` cachées par DPI, un seul handle d'événement HID réutilisé, `ImmDisableIME(-1)` pour éviter `MSCTF.dll`, `KERNELBASE!RegGetValueW` pour éviter `advapi32.dll`, et `DeviceIoControl` direct pour éviter `hid.dll`.
 
 ## Démarrage automatique avec Windows
 
@@ -43,11 +43,9 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v BatteryTray /
 ## Lancer / arrêter manuellement
 
 ```powershell
-# Lancer
+# Lancer (ou redémarrer après mise à jour)
+Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
 Start-Process "C:\Users\kiera\Projects\battery-tray\target\release\battery-tray.exe"
-
-# Arrêter
-Stop-Process -Name battery-tray
 ```
 
 ## Compilation et diagnostic
@@ -55,10 +53,10 @@ Stop-Process -Name battery-tray
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
 
-# Compilation release optimisée (LTO + strip)
+# Compilation release ultra-minimale (#![no_std], -nostdlib, LTO + strip)
 cargo build --release
 
-# Tests unitaires
+# Tests unitaires (9 tests sur les parseurs HID, rendu monochrome, placement et classes Shell)
 cargo test
 
 # Diagnostic HID matériel en direct
@@ -67,16 +65,9 @@ cargo run --bin poc
 
 ## Empreinte mesurée
 
-Mesuré sur `target\release\battery-tray.exe` (Windows 11, après 40 s au repos) :
-
-| Métrique | Avant | Après | Gain |
+| Métrique | Initial (avant reprise) | Mono-thread `std` (`7d06d79`) | **`#![no_std]` `-nostdlib` (actuel)** |
 | --- | --- | --- | --- |
-| Taille binaire | 329 728 o (322,0 Ko) | **304 640 o (297,5 Ko)** | −24,5 Ko |
-| RAM privée (`PrivateMemorySize64`) | 1,64 Mo | **1,14 Mo** | −30 % |
-| Working Set | 9,14 Mo | **7,14 Mo** | −22 % |
-| CPU au repos (`CpuDeltaS`) | 0,0000 s | **0,0000 s** | — |
-| Threads (boot → repos) | 5 → 3 | 4 → **1** | **−2 threads** |
-| Handles noyau | 128 | **91** (`+0` fuite) | **−37 (−29 %)** |
-| Modules / DLL chargés | 29 | **20** | **−9 DLL** |
-
-DLL supprimées : `setupapi.dll`, `DEVOBJ.dll`, `cfgmgr32.dll`, `WINTRUST.dll`, `CRYPT32.dll`, `MSASN1.dll`, `shell32.dll`, `shcore.dll`, `dwmapi.dll`.
+| Taille binaire | 329 728 o (322,0 Ko) | 305 664 o (298,5 Ko) | **24 064 o (23,5 Ko)** (`−92,7 %`) |
+| Dépendances Cargo | `windows` (0.62 + WinRT) | `windows` (0.62) | **0 crate externe** |
+| Imports PE directs (IAT) | `advapi32`, `setupapi`, `shell32`, `shcore`, `dwmapi`, `hid`, `oleaut32`, `user32`, `gdi32`, `kernel32` | `advapi32`, `hid`, `oleaut32`, `user32`, `gdi32`, `kernel32` | **`kernel32`, `kernelbase`, `imm32`, `user32`, `gdi32`** (+ intrinsics UCRT) |
+| Timer de garde UI | 1 000 ms (86 400 réveils/j) | 1 000 ms | **5 000 ms** (`−80 %` + hooks ciblés) |

@@ -3,20 +3,20 @@
 //! Usage: glyphtest.exe [output.bmp]
 
 use battery_tray::{
-    hid::{Battery, Kind},
+    hid::{Battery, BatteryList, Kind},
     widget,
 };
 
-fn blend_bg(bg: (u8, u8, u8), rgba: &[u8], i: usize) -> (u8, u8, u8) {
-    let r = rgba[i * 4] as u16;
-    let g = rgba[i * 4 + 1] as u16;
-    let b = rgba[i * 4 + 2] as u16;
-    let a = rgba[i * 4 + 3] as u16;
+fn blend_premul_bgra_on_bg(bg: (u8, u8, u8), bgra: &[u8], i: usize) -> (u8, u8, u8) {
+    let pb = bgra[i * 4] as u16;
+    let pg = bgra[i * 4 + 1] as u16;
+    let pr = bgra[i * 4 + 2] as u16;
+    let a = bgra[i * 4 + 3] as u16;
     let inv = 255 - a;
     (
-        ((r * a + bg.0 as u16 * inv + 127) / 255) as u8,
-        ((g * a + bg.1 as u16 * inv + 127) / 255) as u8,
-        ((b * a + bg.2 as u16 * inv + 127) / 255) as u8,
+        (pr + (bg.0 as u16 * inv + 127) / 255).min(255) as u8,
+        (pg + (bg.1 as u16 * inv + 127) / 255).min(255) as u8,
+        (pb + (bg.2 as u16 * inv + 127) / 255).min(255) as u8,
     )
 }
 
@@ -56,14 +56,15 @@ fn write_bmp(path: &str, width: usize, height: usize, rgb: &[u8]) {
     std::fs::write(path, out).expect("write bmp");
 }
 
-fn dev(kind: Kind, pct: Option<u8>, charging: bool, online: bool) -> Battery {
-    Battery {
-        name: "Device".to_string(),
-        kind,
-        pct,
-        charging,
-        online,
+fn list2(mouse: Option<(u8, bool)>, headset: Option<(u8, bool)>) -> BatteryList {
+    let mut list = BatteryList::new();
+    if let Some((pct, chg)) = mouse {
+        list.set(Battery::with_name("Mouse", Kind::Mouse, Some(pct), chg, true));
     }
+    if let Some((pct, chg)) = headset {
+        list.set(Battery::with_name("Headset", Kind::Headset, Some(pct), chg, true));
+    }
+    list
 }
 
 fn main() {
@@ -71,11 +72,11 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "widget_preview.bmp".to_string());
 
-    let cases: [Vec<Battery>; 4] = [
-        vec![dev(Kind::Mouse, Some(86), false, true), dev(Kind::Headset, Some(93), false, true)],
-        vec![dev(Kind::Mouse, Some(100), true, true), dev(Kind::Headset, Some(28), false, true)],
-        vec![dev(Kind::Mouse, Some(86), false, false), dev(Kind::Headset, None, false, false)],
-        vec![],
+    let cases: [BatteryList; 4] = [
+        list2(Some((86, false)), Some((93, false))),
+        list2(Some((100, true)), Some((28, false))),
+        list2(Some((86, false)), None),
+        BatteryList::new(),
     ];
 
     let dpis = [96u32, 144];
@@ -104,14 +105,15 @@ fn main() {
                     }
                 }
 
-                let (w, h, rgba) = widget::render_widget_rgba(devs, dpi, light);
+                let (ew, eh) = widget::widget_dimensions(devs, dpi);
+                let mut bgra = vec![0u8; (ew * eh * 4) as usize];
+                let (w, h) = widget::render_widget_premul_bgra(devs, dpi, light, &mut bgra);
                 let wu = w as usize;
                 let hu = h as usize;
 
-                // 1x native render
                 for py in 0..hu {
                     for px in 0..wu {
-                        let c = blend_bg(bg, &rgba, py * wu + px);
+                        let c = blend_premul_bgra_on_bg(bg, &bgra, py * wu + px);
                         let dx = x0 + 10 + px;
                         let dy = y0 + 10 + py;
                         let idx = (dy * width + dx) * 3;
@@ -121,13 +123,12 @@ fn main() {
                     }
                 }
 
-                // 2x zoom below it
                 let zoom = 2usize;
                 let zx0 = x0 + 10;
                 let zy0 = y0 + 16 + hu;
                 for py in 0..hu {
                     for px in 0..wu {
-                        let c = blend_bg(bg, &rgba, py * wu + px);
+                        let c = blend_premul_bgra_on_bg(bg, &bgra, py * wu + px);
                         for zy in 0..zoom {
                             for zx in 0..zoom {
                                 let dx = zx0 + px * zoom + zx;

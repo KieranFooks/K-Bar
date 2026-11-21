@@ -2,28 +2,31 @@
 name = "battery-tray"
 version = "0.1.0"
 edition = "2021"
-description = "Lightweight native tray app showing wireless peripheral battery levels (mouse, headset)"
+description = "Ultra-lightweight #![no_std] Win32 tray utility showing wireless peripheral battery levels"
+
+[lib]
+name = "battery_tray"
+path = "src/lib.rs"
+
+[[bin]]
+name = "battery-tray"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "poc"
+path = "src/bin/poc.rs"
+test = false
+
+[[bin]]
+name = "glyphtest"
+path = "src/bin/glyphtest.rs"
+test = false
 
 [dependencies]
-windows = { version = "0.62", features = [
-    "Foundation",
-    "Devices_Enumeration",
-    "Devices_Power",
-    "System_Power",
-    "Win32_Foundation",
-    "Win32_Devices_HumanInterfaceDevice",
-    "Win32_Storage_FileSystem",
-    "Win32_Security",
-    "Win32_System_IO",
-    "Win32_System_Threading",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Registry",
-    "Win32_UI_Accessibility",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Graphics_Gdi",
-] }
+
+[profile.dev]
+panic = "abort"
 
 [profile.release]
 opt-level = "z"

@@ -10,7 +10,7 @@ pub mod win32;
 use core::ffi::c_void;
 
 use hid::{BatteryList, Kind};
-use win32::{RegGetValueW, ERROR_SUCCESS, HKEY_CURRENT_USER, RRF_RT_ANY};
+use win32::{RegGetValueW, ERROR_SUCCESS, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
 /// Custom window messages handled by the main hidden window.
 pub const WM_POLL_NOW: u32 = 0x8000 + 2;
@@ -26,7 +26,7 @@ pub fn light_theme() -> bool {
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
             w!("SystemUsesLightTheme"),
-            RRF_RT_ANY,
+            RRF_RT_REG_DWORD,
             &mut ty,
             &mut data as *mut u32 as *mut c_void,
             &mut cb,
@@ -60,29 +60,11 @@ mod tests {
     #[test]
     fn merge_devices_preserves_order_and_last_reading_on_missed_poll() {
         let mut prev = BatteryList::new();
-        prev.set(Battery::with_name(
-            "G502 LIGHTSPEED",
-            Kind::Mouse,
-            Some(86),
-            true,
-            true,
-        ));
-        prev.set(Battery::with_name(
-            "HyperX Cloud III Wireless",
-            Kind::Headset,
-            Some(28),
-            false,
-            true,
-        ));
+        prev.set(Battery::new(Kind::Mouse, Some(86), true, true));
+        prev.set(Battery::new(Kind::Headset, Some(28), false, true));
 
         let mut fresh = BatteryList::new();
-        fresh.set(Battery::with_name(
-            "HyperX Cloud III Wireless",
-            Kind::Headset,
-            Some(27),
-            false,
-            true,
-        ));
+        fresh.set(Battery::new(Kind::Headset, Some(27), false, true));
 
         let merged = merge_devices(&prev, fresh);
         assert_eq!(merged.count(), 2);

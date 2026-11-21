@@ -59,10 +59,10 @@ fn write_bmp(path: &str, width: usize, height: usize, rgb: &[u8]) {
 fn list2(mouse: Option<(u8, bool)>, headset: Option<(u8, bool)>) -> BatteryList {
     let mut list = BatteryList::new();
     if let Some((pct, chg)) = mouse {
-        list.set(Battery::with_name("Mouse", Kind::Mouse, Some(pct), chg, true));
+        list.set(Battery::new(Kind::Mouse, Some(pct), chg, true));
     }
     if let Some((pct, chg)) = headset {
-        list.set(Battery::with_name("Headset", Kind::Headset, Some(pct), chg, true));
+        list.set(Battery::new(Kind::Headset, Some(pct), chg, true));
     }
     list
 }

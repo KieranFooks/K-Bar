@@ -4,10 +4,10 @@ Utilitaire natif Windows 11 ultra-minimaliste écrit en **Rust pur `#![no_std]` 
 
 ## Fonctionnement
 
-- **Affichage passif unifié** : bloc transparent aux clics (`WS_EX_TRANSPARENT`), monochrome uniforme sur toutes les lignes, détenu par `Shell_TrayWnd` (zéro clignotement de focus), adapté automatiquement au thème clair/sombre Windows 11 (`WM_SETTINGCHANGE`).
-- **Masquage plein écran** : piloté par événements (`EVENT_SYSTEM_FOREGROUND`, `MOVESIZEEND`, `MINIMIZE*`, `OBJECT_LOCATIONCHANGE` ciblé sur le thread de la barre des tâches) + garde de 5 s.
+- **Affichage passif unifié** : bloc transparent aux clics (`WS_EX_TRANSPARENT`), monochrome uniforme sur toutes les lignes, détenu par `Shell_TrayWnd` (zéro clignotement de focus), adapté automatiquement au thème clair/sombre Windows 11 (`WM_SETTINGCHANGE`) et au DPI (`WM_DPICHANGED`).
+- **Masquage plein écran** : piloté par événements (`EVENT_SYSTEM_FOREGROUND`, `MOVESIZEEND`, `MINIMIZE*`, `OBJECT_LOCATIONCHANGE` filtré sur `Shell_TrayWnd`/`TrayNotifyWnd` et coalescé via `SYNC_PENDING`) + timer de garde de 5 s.
 - **Actualisation** : toutes les **45 secondes**, plus immédiatement au branchement/débranchement USB (`WM_DEVICECHANGE`) et à la sortie de veille (`WM_POWERBROADCAST`).
-- **Empreinte minimale** : zéro allocation sur le chemin rapide de rendu/synchronisation, un seul DIB GDI par redessin, polices `HFONT` cachées par DPI, un seul handle d'événement HID réutilisé, `ImmDisableIME(-1)` pour éviter `MSCTF.dll`, `KERNELBASE!RegGetValueW` pour éviter `advapi32.dll`, et `DeviceIoControl` direct pour éviter `hid.dll`.
+- **Empreinte minimale** : section `.data` nulle (0 o sur disque), zéro allocation sur le chemin rapide, un seul DIB GDI par redessin, polices `HFONT` cachées par DPI, un seul handle d'événement HID réutilisé (y compris pour `DeviceIoControl` overlapped), `ImmDisableIME(-1)` (sans `MSCTF.dll`), `KERNELBASE!RegGetValueW` (sans `advapi32.dll`), et `DeviceIoControl` direct (sans `hid.dll`).
 
 ## Démarrage automatique avec Windows
 
@@ -65,9 +65,12 @@ cargo run --bin poc
 
 ## Empreinte mesurée
 
-| Métrique | Initial (avant reprise) | Mono-thread `std` (`7d06d79`) | **`#![no_std]` `-nostdlib` (actuel)** |
+| Métrique | Initial (avant reprise) | Mono-thread `std` (`7d06d79`) | **`#![no_std]` `-nostdlib` (`fa8c0de` / actuel)** |
 | --- | --- | --- | --- |
-| Taille binaire | 329 728 o (322,0 Ko) | 305 664 o (298,5 Ko) | **24 064 o (23,5 Ko)** (`−92,7 %`) |
+| Taille binaire | `329 728 o` (`322,0 Ko`) | `305 664 o` (`298,5 Ko`) | **`18 944 o` (`18,5 Ko`)** (`−94,3 %`, `.data = 0 o`) |
 | Dépendances Cargo | `windows` (0.62 + WinRT) | `windows` (0.62) | **0 crate externe** |
-| Imports PE directs (IAT) | `advapi32`, `setupapi`, `shell32`, `shcore`, `dwmapi`, `hid`, `oleaut32`, `user32`, `gdi32`, `kernel32` | `advapi32`, `hid`, `oleaut32`, `user32`, `gdi32`, `kernel32` | **`kernel32`, `kernelbase`, `imm32`, `user32`, `gdi32`** (+ intrinsics UCRT) |
-| Timer de garde UI | 1 000 ms (86 400 réveils/j) | 1 000 ms | **5 000 ms** (`−80 %` + hooks ciblés) |
+| RAM privée (`PrivateMemorySize64`) | `1,64 Mo` | `1,14–1,22 Mo` | **`1,21 Mo`** *(mesuré en session sur `fa8c0de`)* |
+| Threads (boot → repos) | `5 → 3` | `4 → 1` | **`1`** *(mesuré en session sur `fa8c0de`)* |
+| Handles noyau | `128` | `91` | **`84`** *(mesuré en session sur `fa8c0de`)* |
+| Modules / DLL en RAM | `29` | `20` | **`16`** *(mesuré en session sur `fa8c0de` ; −`advapi32`, `hid`, `oleaut32`, `MSCTF`)* |
+| Timer de garde UI | `1 000 ms` | `1 000 ms` | **`5 000 ms`** (`−80 %` + hooks coalescés) |

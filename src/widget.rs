@@ -13,15 +13,15 @@ use crate::w;
 use crate::win32::{
     CreateCompatibleDC, CreateDIBSection, CreateWindowExW, DefWindowProcW, DeleteDC,
     DeleteObject, DestroyWindow, DrawTextW, FindWindowExW, FindWindowW, GetClassNameW, GetDC,
-    GetDpiForSystem, GetDpiForWindow, GetForegroundWindow, GetModuleHandleW, GetMonitorInfoW,
-    GetWindow, GetWindowRect, IsWindow, IsWindowVisible, IsZoomed, MonitorFromWindow,
-    RegisterClassW, ReleaseDC, SelectObject, SetBkMode, SetTextColor, SetWindowPos, ShowWindow,
-    SingleThreadCell, UpdateLayeredWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, GW_HWNDPREV, HBITMAP, HDC, HGDIOBJ, HWND, HWND_TOPMOST, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, POINT, RECT, SIZE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-    SW_SHOWNOACTIVATE, TRANSPARENT, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GetDpiForWindow, GetForegroundWindow, GetModuleHandleW, GetMonitorInfoW, GetWindow,
+    GetWindowRect, IsWindow, IsWindowVisible, IsZoomed, MonitorFromWindow, RegisterClassW,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, SetWindowPos, ShowWindow, SingleThreadCell,
+    UpdateLayeredWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    GW_HWNDPREV, HBITMAP, HDC, HGDIOBJ, HWND, HWND_TOPMOST, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    POINT, RECT, SIZE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+    TRANSPARENT, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -32,7 +32,8 @@ pub struct WidgetWindow {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RenderKey {
-    rows: [Option<(Kind, Option<u8>, bool)>; 2],
+    /// Compact row representation: `(kind_tag: 0=none/1=mouse/2=headset, pct: 255=none, charging)`.
+    rows: [(u8, u8, bool); 2],
     dpi: u32,
     light_theme: bool,
     x: i32,
@@ -41,8 +42,37 @@ struct RenderKey {
     h: i32,
 }
 
+impl RenderKey {
+    const fn empty() -> Self {
+        Self {
+            rows: [(0, 0, false); 2],
+            dpi: 0,
+            light_theme: false,
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        }
+    }
+}
+
+struct RenderCache {
+    valid: bool,
+    key: RenderKey,
+}
+
+impl RenderCache {
+    const fn empty() -> Self {
+        Self {
+            valid: false,
+            key: RenderKey::empty(),
+        }
+    }
+}
+
+// All statics below are all-zero at startup so they reside in `.bss` (0 bytes in `.data`).
 static CLASS_REGISTERED: SingleThreadCell<bool> = SingleThreadCell::new(false);
-static LAST_RENDER: SingleThreadCell<Option<RenderKey>> = SingleThreadCell::new(None);
+static LAST_RENDER: SingleThreadCell<RenderCache> = SingleThreadCell::new(RenderCache::empty());
 static LAST_OWNER_ATTEMPT: SingleThreadCell<usize> = SingleThreadCell::new(0);
 static FONTS: SingleThreadCell<FontCache> = SingleThreadCell::new(FontCache::empty());
 
@@ -86,6 +116,7 @@ pub fn is_shell_overlay_class_utf16(wide: &[u16]) -> bool {
 
 /// Single-DIB monochrome GDI render producing premultiplied 32bpp BGRA in `bits`.
 unsafe fn draw_widget_to_dib(
+    fonts: &mut FontCache,
     devices: &BatteryList,
     dpi: u32,
     light_theme: bool,
@@ -129,7 +160,6 @@ unsafe fn draw_widget_to_dib(
     core::ptr::write_bytes(bits as *mut u8, 0, byte_len);
     let old_bmp = SelectObject(memdc, bmp);
 
-    let fonts = &mut *FONTS.get();
     fonts.ensure_dpi(dpi);
     let old_font = SelectObject(memdc, fonts.glyph);
     let _ = SetBkMode(memdc, TRANSPARENT);
@@ -273,11 +303,12 @@ unsafe fn present_widget(
     devices: &BatteryList,
     dpi: u32,
     light_theme: bool,
-) {
+) -> bool {
+    let fonts = &mut *FONTS.get();
     let Some((screen, memdc, bmp, old_bmp, _bits, w, h)) =
-        draw_widget_to_dib(devices, dpi, light_theme)
+        draw_widget_to_dib(fonts, devices, dpi, light_theme)
     else {
-        return;
+        return false;
     };
 
     let dst_pt = POINT { x, y };
@@ -290,7 +321,7 @@ unsafe fn present_widget(
         alpha_format: AC_SRC_ALPHA,
     };
 
-    let _ = UpdateLayeredWindow(
+    let ok = UpdateLayeredWindow(
         hwnd,
         screen,
         &dst_pt,
@@ -300,15 +331,17 @@ unsafe fn present_widget(
         0,
         &blend,
         ULW_ALPHA,
-    );
+    ) != 0;
 
     SelectObject(memdc, old_bmp);
     let _ = DeleteObject(bmp);
     let _ = DeleteDC(memdc);
     ReleaseDC(null_mut(), screen);
+    ok
 }
 
-/// Render premultiplied 32bpp BGRA into `out_bgra` (shared with `glyphtest` and tests).
+/// Render premultiplied 32bpp BGRA into `out_bgra` using a local `FontCache`
+/// (thread-safe helper for `glyphtest` and parallel unit tests).
 pub fn render_widget_premul_bgra(
     devices: &BatteryList,
     dpi: u32,
@@ -316,19 +349,22 @@ pub fn render_widget_premul_bgra(
     out_bgra: &mut [u8],
 ) -> (i32, i32) {
     unsafe {
-        let Some((screen, memdc, bmp, old_bmp, bits, w, h)) =
-            draw_widget_to_dib(devices, dpi, light_theme)
-        else {
-            return (0, 0);
+        let mut fonts = FontCache::empty();
+        let res = draw_widget_to_dib(&mut fonts, devices, dpi, light_theme);
+        let dims = if let Some((screen, memdc, bmp, old_bmp, bits, w, h)) = res {
+            let byte_len = ((w * h * 4) as usize).min(out_bgra.len());
+            let src = core::slice::from_raw_parts(bits, byte_len);
+            out_bgra[..byte_len].copy_from_slice(src);
+            SelectObject(memdc, old_bmp);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(memdc);
+            ReleaseDC(null_mut(), screen);
+            (w, h)
+        } else {
+            (0, 0)
         };
-        let byte_len = ((w * h * 4) as usize).min(out_bgra.len());
-        let src = core::slice::from_raw_parts(bits, byte_len);
-        out_bgra[..byte_len].copy_from_slice(src);
-        SelectObject(memdc, old_bmp);
-        let _ = DeleteObject(bmp);
-        let _ = DeleteDC(memdc);
-        ReleaseDC(null_mut(), screen);
-        (w, h)
+        fonts.clear();
+        dims
     }
 }
 
@@ -431,8 +467,8 @@ unsafe fn is_above_taskbar(widget: HWND, tray: HWND) -> bool {
 /// Must be called on the UI thread.
 pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
     let hinst = GetModuleHandleW(null());
-    let reg = &mut *CLASS_REGISTERED.get();
-    if !*reg {
+    let reg = *CLASS_REGISTERED.get();
+    if !reg {
         let wc = WNDCLASSW {
             lpfn_wnd_proc: Some(widget_proc),
             h_instance: hinst,
@@ -440,7 +476,7 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
             ..Default::default()
         };
         let _ = RegisterClassW(&wc);
-        *reg = true;
+        *CLASS_REGISTERED.get() = true;
     }
 
     if let Some(owner) = owner_tray {
@@ -490,18 +526,32 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
     }
 }
 
+fn encode_row(slot: Option<crate::hid::Battery>) -> (u8, u8, bool) {
+    match slot {
+        None => (0, 0, false),
+        Some(b) => (
+            match b.kind {
+                Kind::Mouse => 1,
+                Kind::Headset => 2,
+            },
+            b.pct.unwrap_or(255),
+            b.charging,
+        ),
+    }
+}
+
 /// Synchronize the taskbar block's ownership, visibility, position, and rendered bitmap.
-/// Returns the currently tracked `Shell_TrayWnd` handle if found.
+/// Returns `(Shell_TrayWnd, TrayNotifyWnd)` handles when present.
 ///
 /// # Safety
-/// Must be called on the UI thread.
+/// Must be called on the UI thread without re-entering.
 pub unsafe fn sync_position(
     main: HWND,
     slot: &mut Option<WidgetWindow>,
     devices: &BatteryList,
     light_theme: bool,
     force_redraw: bool,
-) -> Option<HWND> {
+) -> (Option<HWND>, Option<HWND>) {
     let tray_hwnd = FindWindowW(w!("Shell_TrayWnd"), null());
     if tray_hwnd.is_null() {
         if let Some(w_info) = *slot {
@@ -509,15 +559,22 @@ pub unsafe fn sync_position(
                 let _ = ShowWindow(w_info.hwnd, SW_HIDE);
             }
         }
-        return None;
+        return (None, None);
     }
 
+    let notify_hwnd = FindWindowExW(tray_hwnd, null_mut(), w!("TrayNotifyWnd"), null());
+    let notify_opt = if notify_hwnd.is_null() {
+        None
+    } else {
+        Some(notify_hwnd)
+    };
+
     let tray_raw = tray_hwnd as usize;
-    let last_attempt = &mut *LAST_OWNER_ATTEMPT.get();
+    let last_attempt = *LAST_OWNER_ATTEMPT.get();
     let needs_create = match *slot {
         None => true,
         Some(w) if IsWindow(w.hwnd) == 0 => true,
-        Some(w) => w.owner_tray != Some(tray_hwnd) && *last_attempt != tray_raw,
+        Some(w) => w.owner_tray != Some(tray_hwnd) && last_attempt != tray_raw,
     };
 
     let mut recreated = false;
@@ -527,20 +584,20 @@ pub unsafe fn sync_position(
                 let _ = DestroyWindow(old.hwnd);
             }
         }
-        *LAST_RENDER.get() = None;
-        *last_attempt = tray_raw;
+        (*LAST_RENDER.get()).valid = false;
+        *LAST_OWNER_ATTEMPT.get() = tray_raw;
         *slot = create(Some(tray_hwnd));
         recreated = true;
     }
 
     let Some(w_info) = *slot else {
-        return Some(tray_hwnd);
+        return (Some(tray_hwnd), notify_opt);
     };
     let widget = w_info.hwnd;
 
     let mut tray_rc = RECT::default();
     if GetWindowRect(tray_hwnd, &mut tray_rc) == 0 {
-        return Some(tray_hwnd);
+        return (Some(tray_hwnd), notify_opt);
     }
 
     let hmon = MonitorFromWindow(tray_hwnd, MONITOR_DEFAULTTONEAREST);
@@ -555,36 +612,26 @@ pub unsafe fn sync_position(
         if IsWindowVisible(widget) != 0 {
             let _ = ShowWindow(widget, SW_HIDE);
         }
-        return Some(tray_hwnd);
+        return (Some(tray_hwnd), notify_opt);
     }
 
     let d = GetDpiForWindow(tray_hwnd);
-    let dpi = if d >= 96 {
-        d
-    } else {
-        GetDpiForSystem().max(96)
-    };
+    let dpi = if d >= 96 { d } else { 96 };
 
-    let notify_hwnd = FindWindowExW(tray_hwnd, null_mut(), w!("TrayNotifyWnd"), null());
-    let notify_rc = if !notify_hwnd.is_null() {
+    let notify_rc = notify_opt.and_then(|n| {
         let mut r = RECT::default();
-        if GetWindowRect(notify_hwnd, &mut r) != 0 {
+        if GetWindowRect(n, &mut r) != 0 {
             Some(r)
         } else {
             None
         }
-    } else {
-        None
-    };
+    });
 
     let (w, h) = widget_dimensions(devices, dpi);
     let (x, y) = compute_widget_rect(tray_rc, notify_rc, w, h, dpi);
 
     let key = RenderKey {
-        rows: [
-            devices.slots[0].map(|b| (b.kind, b.pct, b.charging)),
-            devices.slots[1].map(|b| (b.kind, b.pct, b.charging)),
-        ],
+        rows: [encode_row(devices.slots[0]), encode_row(devices.slots[1])],
         dpi,
         light_theme,
         x,
@@ -593,11 +640,15 @@ pub unsafe fn sync_position(
         h,
     };
 
-    let last = &mut *LAST_RENDER.get();
-    let needs_redraw = recreated || force_redraw || *last != Some(key);
-    if needs_redraw {
-        *last = Some(key);
-        present_widget(widget, x, y, devices, dpi, light_theme);
+    let (was_valid, prev_key) = {
+        let cache = &*LAST_RENDER.get();
+        (cache.valid, cache.key)
+    };
+    let needs_redraw = recreated || force_redraw || !was_valid || prev_key != key;
+    if needs_redraw && present_widget(widget, x, y, devices, dpi, light_theme) {
+        let cache = &mut *LAST_RENDER.get();
+        cache.valid = true;
+        cache.key = key;
     }
 
     if IsWindowVisible(widget) == 0 {
@@ -616,7 +667,7 @@ pub unsafe fn sync_position(
         );
     }
 
-    Some(tray_hwnd)
+    (Some(tray_hwnd), notify_opt)
 }
 
 /// Destroy the taskbar block window and cached GDI fonts cleanly.
@@ -624,7 +675,7 @@ pub unsafe fn sync_position(
 /// # Safety
 /// Must be called on the UI thread.
 pub unsafe fn destroy(w: WidgetWindow) {
-    *LAST_RENDER.get() = None;
+    (*LAST_RENDER.get()).valid = false;
     *LAST_OWNER_ATTEMPT.get() = 0;
     (*FONTS.get()).clear();
     if IsWindow(w.hwnd) != 0 {
@@ -644,30 +695,12 @@ mod tests {
     #[test]
     fn widget_render_is_uniform_and_monochrome_on_dark_and_light_themes() {
         let mut online_devs = BatteryList::new();
-        online_devs.set(Battery::with_name("G502 LIGHTSPEED", Kind::Mouse, Some(86), false, true));
-        online_devs.set(Battery::with_name(
-            "HyperX Cloud III Wireless",
-            Kind::Headset,
-            Some(100),
-            true,
-            true,
-        ));
+        online_devs.set(Battery::new(Kind::Mouse, Some(86), false, true));
+        online_devs.set(Battery::new(Kind::Headset, Some(100), true, true));
 
         let mut offline_mouse_devs = BatteryList::new();
-        offline_mouse_devs.set(Battery::with_name(
-            "G502 LIGHTSPEED",
-            Kind::Mouse,
-            Some(86),
-            false,
-            false,
-        ));
-        offline_mouse_devs.set(Battery::with_name(
-            "HyperX Cloud III Wireless",
-            Kind::Headset,
-            Some(100),
-            true,
-            true,
-        ));
+        offline_mouse_devs.set(Battery::new(Kind::Mouse, Some(86), false, false));
+        offline_mouse_devs.set(Battery::new(Kind::Headset, Some(100), true, true));
 
         for dpi in [96u32, 144] {
             for light in [false, true] {
@@ -735,9 +768,15 @@ mod tests {
         assert!(is_shell_overlay_class_utf16(&to_u16("Progman")));
         assert!(is_shell_overlay_class_utf16(&to_u16("WorkerW")));
         assert!(is_shell_overlay_class_utf16(&to_u16("Shell_TrayWnd")));
-        assert!(is_shell_overlay_class_utf16(&to_u16("Windows.UI.Core.CoreWindow")));
-        assert!(is_shell_overlay_class_utf16(&to_u16("XamlExplorerHostIslandWindow")));
-        assert!(is_shell_overlay_class_utf16(&to_u16("MultitaskingViewFrame")));
+        assert!(is_shell_overlay_class_utf16(&to_u16(
+            "Windows.UI.Core.CoreWindow"
+        )));
+        assert!(is_shell_overlay_class_utf16(&to_u16(
+            "XamlExplorerHostIslandWindow"
+        )));
+        assert!(is_shell_overlay_class_utf16(&to_u16(
+            "MultitaskingViewFrame"
+        )));
         assert!(!is_shell_overlay_class_utf16(&to_u16("Chrome_WidgetWin_1")));
         assert!(!is_shell_overlay_class_utf16(&to_u16("UnrealWindow")));
     }

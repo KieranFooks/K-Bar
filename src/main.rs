@@ -7,10 +7,11 @@
 #![cfg_attr(not(test), no_main)]
 #![windows_subsystem = "windows"]
 
+use core::mem::MaybeUninit;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use core::ptr::{null, null_mut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::ptr::{addr_of_mut, null, null_mut};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use battery_tray::hid::{BatteryList, HidScanner};
 use battery_tray::widget::WidgetWindow;
@@ -23,8 +24,9 @@ use battery_tray::win32::{
     ERROR_ALREADY_EXISTS, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
     EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, HWND,
     HWINEVENTHOOK, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_POWERBROADCAST,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
 };
 use battery_tray::{light_theme, merge_devices, w, widget, WM_POLL_NOW, WM_SYNC_WIDGET};
 
@@ -36,6 +38,10 @@ const WIDGET_SYNC_INTERVAL_MS: u32 = 5_000;
 
 static TASKBAR_CREATED: AtomicUsize = AtomicUsize::new(0);
 static MAIN_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
+static TRAY_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
+static NOTIFY_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
+static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
+static APP_INIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -49,49 +55,67 @@ struct AppState {
     widget: Option<WidgetWindow>,
     scanner: HidScanner,
     polling: bool,
+    syncing: bool,
     devices: BatteryList,
     light_theme: bool,
     tray_pid: u32,
+    tray_tid: u32,
     tray_loc_hook: HWINEVENTHOOK,
 }
 
 impl AppState {
-    const fn empty() -> Self {
-        Self {
-            active: false,
-            main: null_mut(),
-            widget: None,
-            scanner: HidScanner::new(),
-            polling: false,
-            devices: BatteryList::new(),
-            light_theme: false,
-            tray_pid: 0,
-            tray_loc_hook: null_mut(),
-        }
+    /// Initialize `AppState` directly in `.bss` (`MaybeUninit::zeroed()`) without a large stack copy.
+    unsafe fn init_in_place(dst: *mut Self, main: HWND, light: bool) {
+        addr_of_mut!((*dst).active).write(true);
+        addr_of_mut!((*dst).main).write(main);
+        addr_of_mut!((*dst).widget).write(None);
+        HidScanner::init_in_place(addr_of_mut!((*dst).scanner));
+        addr_of_mut!((*dst).polling).write(false);
+        addr_of_mut!((*dst).syncing).write(false);
+        addr_of_mut!((*dst).devices).write(BatteryList::new());
+        addr_of_mut!((*dst).light_theme).write(light);
+        addr_of_mut!((*dst).tray_pid).write(0);
+        addr_of_mut!((*dst).tray_tid).write(0);
+        addr_of_mut!((*dst).tray_loc_hook).write(null_mut());
     }
 }
 
-static APP: SingleThreadCell<AppState> = SingleThreadCell::new(AppState::empty());
+// Stored in `.bss` via `MaybeUninit::zeroed()` so `.data` stays 0 bytes on disk.
+static APP: SingleThreadCell<MaybeUninit<AppState>> = SingleThreadCell::new(MaybeUninit::zeroed());
 
-unsafe fn ensure_tray_location_hook(tray_hwnd: Option<HWND>) {
+#[inline]
+unsafe fn app_mut() -> Option<&'static mut AppState> {
+    if APP_INIT.load(Ordering::Acquire) {
+        Some((*APP.get()).assume_init_mut())
+    } else {
+        None
+    }
+}
+
+unsafe fn update_tray_tracking(tray_hwnd: Option<HWND>, notify_hwnd: Option<HWND>) {
+    TRAY_HWND_RAW.store(tray_hwnd.map_or(0, |h| h as usize), Ordering::Relaxed);
+    NOTIFY_HWND_RAW.store(notify_hwnd.map_or(0, |h| h as usize), Ordering::Relaxed);
+
     let Some(tray) = tray_hwnd else { return };
     let mut pid = 0u32;
     let tid = GetWindowThreadProcessId(tray, &mut pid);
     if pid == 0 || tid == 0 {
         return;
     }
-    let state = &mut *APP.get();
+    let Some(state) = app_mut() else { return };
     if !state.active {
         return;
     }
-    if state.tray_pid == pid && !state.tray_loc_hook.is_null() {
+    if state.tray_pid == pid && state.tray_tid == tid && !state.tray_loc_hook.is_null() {
         return;
     }
     if !state.tray_loc_hook.is_null() {
-        let _ = UnhookWinEvent(state.tray_loc_hook);
+        let old_hook = state.tray_loc_hook;
         state.tray_loc_hook = null_mut();
+        let _ = UnhookWinEvent(old_hook);
     }
     state.tray_pid = pid;
+    state.tray_tid = tid;
     state.tray_loc_hook = SetWinEventHook(
         EVENT_OBJECT_LOCATIONCHANGE,
         EVENT_OBJECT_LOCATIONCHANGE,
@@ -104,68 +128,120 @@ unsafe fn ensure_tray_location_hook(tray_hwnd: Option<HWND>) {
 }
 
 unsafe fn sync_widget(force_redraw: bool) {
-    let (active, main, mut slot, devices, light) = {
-        let state = &mut *APP.get();
-        if !state.active {
+    let (main, mut slot, devices, light) = {
+        let Some(state) = app_mut() else { return };
+        if !state.active || state.syncing {
             return;
         }
+        state.syncing = true;
         (
-            true,
             state.main,
             state.widget.take(),
             state.devices,
             state.light_theme,
         )
     };
-    if !active {
-        return;
+
+    let (tray_hwnd, notify_hwnd) =
+        widget::sync_position(main, &mut slot, &devices, light, force_redraw);
+
+    let mut leftover = None;
+    if let Some(state) = app_mut() {
+        state.syncing = false;
+        if state.active {
+            if let Some(orphan) = state.widget.take() {
+                leftover = Some(orphan);
+            }
+            state.widget = slot;
+            update_tray_tracking(tray_hwnd, notify_hwnd);
+        } else {
+            leftover = slot;
+        }
+    } else {
+        leftover = slot;
     }
-
-    let tray_hwnd = widget::sync_position(main, &mut slot, &devices, light, force_redraw);
-
-    let state = &mut *APP.get();
-    if state.active {
-        state.widget = slot;
-        ensure_tray_location_hook(tray_hwnd);
-    } else if let Some(w) = slot {
+    if let Some(w) = leftover {
         widget::destroy(w);
     }
 }
 
 unsafe fn run_poll(force_rescan: bool) {
-    let state = &mut *APP.get();
-    if !state.active || state.polling {
-        return;
-    }
-    state.polling = true;
-    let scanner_ptr = &mut state.scanner as *mut HidScanner;
+    let scanner_ptr = {
+        let Some(state) = app_mut() else { return };
+        if !state.active || state.polling {
+            return;
+        }
+        state.polling = true;
+        &mut state.scanner as *mut HidScanner
+    };
+
     let fresh = (*scanner_ptr).poll(force_rescan);
 
     let (main, mut slot, devices, light) = {
-        let state = &mut *APP.get();
+        let Some(state) = app_mut() else { return };
         state.polling = false;
         if !state.active {
+            state.scanner.close();
             return;
         }
         state.devices = merge_devices(&state.devices, fresh);
         (state.main, state.widget.take(), state.devices, state.light_theme)
     };
 
-    let tray_hwnd = widget::sync_position(main, &mut slot, &devices, light, true);
+    let (tray_hwnd, notify_hwnd) = widget::sync_position(main, &mut slot, &devices, light, true);
 
-    let state = &mut *APP.get();
-    if state.active {
-        state.widget = slot;
-        ensure_tray_location_hook(tray_hwnd);
-    } else if let Some(w) = slot {
+    let mut leftover = None;
+    if let Some(state) = app_mut() {
+        if state.active {
+            if let Some(orphan) = state.widget.take() {
+                leftover = Some(orphan);
+            }
+            state.widget = slot;
+            update_tray_tracking(tray_hwnd, notify_hwnd);
+        } else {
+            leftover = slot;
+        }
+    } else {
+        leftover = slot;
+    }
+    if let Some(w) = leftover {
+        widget::destroy(w);
+    }
+}
+
+unsafe fn cleanup_app_state(hwnd: HWND) {
+    let _ = KillTimer(hwnd, POLL_TIMER_ID);
+    let _ = KillTimer(hwnd, DEVICECHANGE_DEBOUNCE_TIMER_ID);
+    let _ = KillTimer(hwnd, WIDGET_SYNC_TIMER_ID);
+
+    MAIN_HWND_RAW.store(0, Ordering::Relaxed);
+    TRAY_HWND_RAW.store(0, Ordering::Relaxed);
+    NOTIFY_HWND_RAW.store(0, Ordering::Relaxed);
+
+    let Some(state) = app_mut() else { return };
+    if !state.active {
+        return;
+    }
+    state.active = false;
+    let widget_opt = state.widget.take();
+    let loc_hook = state.tray_loc_hook;
+    state.tray_loc_hook = null_mut();
+    if !state.polling {
+        state.scanner.close();
+    }
+
+    if !loc_hook.is_null() {
+        let _ = UnhookWinEvent(loc_hook);
+    }
+    if let Some(w) = widget_opt {
         widget::destroy(w);
     }
 }
 
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
-    _event: u32,
-    _hwnd: HWND,
+    event: u32,
+    hwnd: HWND,
     id_object: i32,
     _id_child: i32,
     _id_event_thread: u32,
@@ -174,9 +250,17 @@ unsafe extern "system" fn win_event_proc(
     if id_object != 0 {
         return;
     }
+    if event == EVENT_OBJECT_LOCATIONCHANGE {
+        let h = hwnd as usize;
+        let tray = TRAY_HWND_RAW.load(Ordering::Relaxed);
+        let notify = NOTIFY_HWND_RAW.load(Ordering::Relaxed);
+        if h != tray && (notify == 0 || h != notify) {
+            return;
+        }
+    }
     let raw = MAIN_HWND_RAW.load(Ordering::Relaxed);
-    if raw != 0 {
-        let _ = PostMessageW(raw as HWND, WM_SYNC_WIDGET, 0, 0);
+    if raw != 0 && !SYNC_PENDING.swap(true, Ordering::AcqRel) && PostMessageW(raw as HWND, WM_SYNC_WIDGET, 0, 0) == 0 {
+        SYNC_PENDING.store(false, Ordering::Release);
     }
 }
 
@@ -186,20 +270,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             run_poll(true);
             0
         }
-        WM_SYNC_WIDGET | WM_DISPLAYCHANGE => {
-            sync_widget(msg == WM_DISPLAYCHANGE);
+        WM_SYNC_WIDGET => {
+            SYNC_PENDING.store(false, Ordering::Release);
+            sync_widget(false);
+            0
+        }
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            sync_widget(true);
             0
         }
         WM_SETTINGCHANGE => {
             let light = light_theme();
-            let changed = {
-                let state = &mut *APP.get();
+            let changed = if let Some(state) = app_mut() {
                 if state.active && state.light_theme != light {
                     state.light_theme = light;
                     true
                 } else {
                     false
                 }
+            } else {
+                false
             };
             if changed {
                 sync_widget(true);
@@ -208,7 +298,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_DEVICECHANGE => {
             let _ = SetTimer(hwnd, DEVICECHANGE_DEBOUNCE_TIMER_ID, 1500, null());
-            0
+            1
         }
         WM_TIMER if wp == DEVICECHANGE_DEBOUNCE_TIMER_ID => {
             let _ = KillTimer(hwnd, DEVICECHANGE_DEBOUNCE_TIMER_ID);
@@ -227,32 +317,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             if wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND {
                 run_poll(true);
             }
-            0
+            1
         }
         WM_CLOSE => {
-            let _ = KillTimer(hwnd, POLL_TIMER_ID);
-            let _ = KillTimer(hwnd, DEVICECHANGE_DEBOUNCE_TIMER_ID);
-            let _ = KillTimer(hwnd, WIDGET_SYNC_TIMER_ID);
-
-            let (widget_opt, loc_hook, scanner_dummy) = {
-                let state = &mut *APP.get();
-                state.active = false;
-                let w = state.widget.take();
-                let h = state.tray_loc_hook;
-                state.tray_loc_hook = null_mut();
-                let sc = core::mem::replace(&mut state.scanner, HidScanner::new());
-                (w, h, sc)
-            };
-            if !loc_hook.is_null() {
-                let _ = UnhookWinEvent(loc_hook);
-            }
-            if let Some(w) = widget_opt {
-                widget::destroy(w);
-            }
-            drop(scanner_dummy);
-
-            MAIN_HWND_RAW.store(0, Ordering::Relaxed);
+            cleanup_app_state(hwnd);
             let _ = DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            cleanup_app_state(hwnd);
             PostQuitMessage(0);
             0
         }
@@ -319,12 +392,8 @@ pub extern "system" fn mainCRTStartup() -> ! {
             Ordering::Relaxed,
         );
 
-        {
-            let state = &mut *APP.get();
-            state.active = true;
-            state.main = hwnd;
-            state.light_theme = light_theme();
-        }
+        AppState::init_in_place((*APP.get()).as_mut_ptr(), hwnd, light_theme());
+        APP_INIT.store(true, Ordering::Release);
 
         sync_widget(true);
 
@@ -370,16 +439,7 @@ pub extern "system" fn mainCRTStartup() -> ! {
                 let _ = UnhookWinEvent(hook);
             }
         }
-        let loc_hook = {
-            let state = &mut *APP.get();
-            let h = state.tray_loc_hook;
-            state.tray_loc_hook = null_mut();
-            h
-        };
-        if !loc_hook.is_null() {
-            let _ = UnhookWinEvent(loc_hook);
-        }
-
+        cleanup_app_state(hwnd);
         let _ = CloseHandle(instance_mutex);
         ExitProcess(0)
     }

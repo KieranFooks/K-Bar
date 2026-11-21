@@ -75,12 +75,7 @@ unsafe fn make_font(height: i32, face: *const u16) -> HFONT {
 }
 
 unsafe fn make_glyph_font(height: i32) -> HFONT {
-    let f = make_font(height, w!("Segoe Fluent Icons"));
-    if !f.is_null() {
-        f
-    } else {
-        make_font(height, w!("Segoe MDL2 Assets"))
-    }
+    make_font(height, w!("Segoe Fluent Icons"))
 }
 
 pub struct FontCache {

@@ -26,27 +26,39 @@ fn main() {
         let ev = CreateEventW(null(), 1, 0, null());
         for cand in &cands[..count] {
             let pstr = String::from_utf16_lossy(cand.path.as_slice());
+            let h = CreateFileW(
+                cand.path.buf.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                null_mut(),
+            );
+            let mut prod = String::new();
+            if h != INVALID_HANDLE_VALUE && !ev.is_null() {
+                let mut wbuf = [0u16; 128];
+                let plen = hid::probe_product_string_utf16(h, ev, &mut wbuf);
+                prod = String::from_utf16_lossy(&wbuf[..plen]);
+            }
             println!(
-                "  VID={:04X} PID={:04X} UP={:04X} U={:04X} path={pstr}",
-                cand.vid, cand.pid, cand.usage_page, cand.usage
+                "  VID={:04X} PID={:04X} UP={:04X} U={:04X} product='{}' path={pstr}",
+                cand.vid, cand.pid, cand.usage_page, cand.usage, prod
             );
 
-            if cand.vid == 0x046D && !ev.is_null() {
-                let h = CreateFileW(
-                    cand.path.buf.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED,
-                    null_mut(),
-                );
-                if h != INVALID_HANDLE_VALUE {
+            if h != INVALID_HANDLE_VALUE {
+                if cand.vid == 0x046D && !ev.is_null() {
                     let mut r = [0u8; 64];
-                    if let Some(pn) = hidpp_request(h, ev, (1, 0x00, 0x01), &[0, 0, 0x5A], 250, &mut r)
+                    if let Some(pn) =
+                        hidpp_request(h, ev, (1, 0x00, 0x01), &[0, 0, 0x5A], 250, &mut r)
                     {
                         if pn >= 7 && r[6] == 0x5A {
-                            println!("    dev_idx=1 HID++ {}.{} ping={}", r[4], r[5], hex(&r[..pn.min(8)]));
+                            println!(
+                                "    dev_idx=1 HID++ {}.{} ping={}",
+                                r[4],
+                                r[5],
+                                hex(&r[..pn.min(8)])
+                            );
                             for (fid, label) in [
                                 (0x1004u16, "UnifiedBattery"),
                                 (0x1000u16, "BatteryStatus"),
@@ -67,8 +79,12 @@ fn main() {
                                             hidpp_request(h, ev, (1, idx, func), &[], 250, &mut r)
                                         {
                                             let parsed = match fid {
-                                                0x1004 => format!("{:?}", parse_1004_status(&r[..bn])),
-                                                0x1000 => format!("{:?}", parse_1000_status(&r[..bn])),
+                                                0x1004 => {
+                                                    format!("{:?}", parse_1004_status(&r[..bn]))
+                                                }
+                                                0x1000 => {
+                                                    format!("{:?}", parse_1000_status(&r[..bn]))
+                                                }
                                                 _ => format!("{:?}", parse_1001_voltage(&r[..bn])),
                                             };
                                             println!(
@@ -81,8 +97,8 @@ fn main() {
                             }
                         }
                     }
-                    let _ = CloseHandle(h);
                 }
+                let _ = CloseHandle(h);
             }
         }
         if !ev.is_null() {
@@ -96,12 +112,8 @@ fn main() {
     let list = hid::read_all();
     for b in list.slots.into_iter().flatten() {
         println!(
-            "  {:?}: {} | pct={:?} | charging={} | online={}",
-            b.kind,
-            b.name_str(),
-            b.pct,
-            b.charging,
-            b.online
+            "  {:?}: pct={:?} | charging={} | online={}",
+            b.kind, b.pct, b.charging, b.online
         );
     }
 }

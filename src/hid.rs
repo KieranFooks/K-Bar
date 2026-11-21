@@ -1,13 +1,13 @@
 //! Battery readers for wireless peripherals over raw HID (`#![no_std]`, zero heap allocations).
 //!
-//! - Uses `user32` Raw Input + `kernel32` `CreateFileW`/`DeviceIoControl` directly (zero `setupapi.dll`, zero `hid.dll`).
+//! - Uses `user32` Raw Input + overlapped `kernel32` `CreateFileW`/`DeviceIoControl` (zero `setupapi.dll`, zero `hid.dll`).
 //! - Logitech HID++ 2.0 (VID 046D) vendor page 0xFF00 / usage 0x0002 (20-byte long reports `0x11`):
-//!   `sw_id = 0x0A`, Root `0x0000` lookup, `0x0005` name, and `0x1004`/`0x1000`/`0x1001` battery.
+//!   `sw_id = 0x0A`, Root `0x0000` lookup, `0x0005` `getDeviceType == 3` (Mouse), and `0x1004`/`0x1000`/`0x1001`.
 //! - HyperX Cloud III Wireless (VID 03F0, PID 05B7) vendor page 0xFF13:
 //!   62-byte packets, report id 0x66, cmd 0x89 = battery (0/0 when powered off), cmd 0x8A = charging.
 
 use core::ffi::c_void;
-use core::ptr::{null, null_mut};
+use core::ptr::{addr_of_mut, null, null_mut};
 
 use crate::win32::{
     CancelIoEx, CloseHandle, CreateEventW, CreateFileW, DeviceIoControl, GetLastError,
@@ -24,8 +24,8 @@ use crate::win32::{
 pub const HIDPP_SW_ID: u8 = 0x0A;
 
 const HID_PATH_CAP: usize = 256;
-const RAW_LIST_CAP: usize = 64;
-const LOGI_CAND_CAP: usize = 2;
+const RAW_LIST_CAP: usize = 128;
+const LOGI_CAND_CAP: usize = 4;
 
 /// Non-linear Li-ion discharge table (100% down to 1%, mV) from Linux `hid-logitech-hidpp.c`.
 const LOGITECH_VOLTAGES_MV: [u16; 100] = [
@@ -46,8 +46,6 @@ pub enum Kind {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Battery {
-    pub name: [u8; 64],
-    pub name_len: u8,
     pub kind: Kind,
     pub pct: Option<u8>,
     pub charging: bool,
@@ -57,32 +55,11 @@ pub struct Battery {
 impl Battery {
     pub const fn new(kind: Kind, pct: Option<u8>, charging: bool, online: bool) -> Self {
         Self {
-            name: [0u8; 64],
-            name_len: 0,
             kind,
             pct,
             charging,
             online,
         }
-    }
-
-    pub fn with_name(
-        name: &str,
-        kind: Kind,
-        pct: Option<u8>,
-        charging: bool,
-        online: bool,
-    ) -> Self {
-        let mut b = Self::new(kind, pct, charging, online);
-        let bytes = name.as_bytes();
-        let n = bytes.len().min(b.name.len());
-        b.name[..n].copy_from_slice(&bytes[..n]);
-        b.name_len = n as u8;
-        b
-    }
-
-    pub fn name_str(&self) -> &str {
-        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("")
     }
 }
 
@@ -155,7 +132,8 @@ pub fn match_hidpp_reply(r: &[u8], dev_idx: u8, feat_idx: u8, func: u8) -> Match
     if r[2] == 0xFF && r[3] == feat_idx && r[4] == expected_fn_sw {
         return MatchReply::ProtocolError;
     }
-    if r[2] == 0x8F {
+    // HID++ 1.0 error frame matching our feature index and sw_id
+    if r[2] == 0x8F && r[3] == feat_idx && r[4] == expected_fn_sw {
         return MatchReply::ProtocolError;
     }
     MatchReply::Ignore
@@ -176,7 +154,7 @@ pub fn parse_1004_status(r: &[u8]) -> Option<(u8, bool)> {
     if r.len() < 7 {
         return None;
     }
-    Some((r[4].min(100), matches!(r[6], 1 | 2)))
+    Some((r[4].min(100), matches!(r[6], 1 | 2 | 4)))
 }
 
 /// Parse HID++ 2.0 `0x1000` BatteryLevelStatus `func 0` response.
@@ -259,25 +237,37 @@ impl CachedCandidate {
 }
 
 unsafe fn open_hid(path: *const u16) -> Option<HANDLE> {
-    let try_open = |access: u32| {
-        CreateFileW(
-            path,
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
-            null_mut(),
-        )
-    };
-    let h = try_open(GENERIC_READ | GENERIC_WRITE);
+    let h = CreateFileW(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        null(),
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,
+        null_mut(),
+    );
     if h != INVALID_HANDLE_VALUE {
-        return Some(h);
-    }
-    let h0 = try_open(0);
-    if h0 != INVALID_HANDLE_VALUE {
-        Some(h0)
+        Some(h)
     } else {
+        None
+    }
+}
+
+unsafe fn finish_overlapped(h: HANDLE, ev: HANDLE, ov: &OVERLAPPED, timeout_ms: u32) -> Option<u32> {
+    if GetLastError() != ERROR_IO_PENDING {
+        return None;
+    }
+    if WaitForSingleObject(ev, timeout_ms) == WAIT_OBJECT_0 {
+        let mut got = 0u32;
+        if GetOverlappedResult(h, ov, &mut got, 0) != 0 {
+            Some(got)
+        } else {
+            None
+        }
+    } else {
+        let _ = CancelIoEx(h, ov);
+        let mut dummy = 0u32;
+        let _ = GetOverlappedResult(h, ov, &mut dummy, 1);
         None
     }
 }
@@ -292,26 +282,10 @@ unsafe fn send_report(h: HANDLE, ev: HANDLE, buf: &[u8], timeout_ms: u32) -> boo
     if WriteFile(h, buf.as_ptr(), buf.len() as u32, &mut written, &mut ov) != 0 {
         return true;
     }
-    if GetLastError() != ERROR_IO_PENDING {
-        return false;
-    }
-    if WaitForSingleObject(ev, timeout_ms) == WAIT_OBJECT_0 {
-        let mut got = 0u32;
-        GetOverlappedResult(h, &ov, &mut got, 0) != 0
-    } else {
-        let _ = CancelIoEx(h, &ov);
-        let mut dummy = 0u32;
-        let _ = GetOverlappedResult(h, &ov, &mut dummy, 1);
-        false
-    }
+    finish_overlapped(h, ev, &ov, timeout_ms).is_some()
 }
 
-unsafe fn recv_report(
-    h: HANDLE,
-    ev: HANDLE,
-    timeout_ms: u32,
-    out: &mut [u8; 64],
-) -> Option<usize> {
+unsafe fn recv_report(h: HANDLE, ev: HANDLE, timeout_ms: u32, out: &mut [u8; 64]) -> Option<usize> {
     if ev.is_null() {
         return None;
     }
@@ -322,71 +296,37 @@ unsafe fn recv_report(
     if ReadFile(h, out.as_mut_ptr(), out.len() as u32, &mut read, &mut ov) != 0 {
         return Some(read as usize);
     }
-    if GetLastError() != ERROR_IO_PENDING {
+    finish_overlapped(h, ev, &ov, timeout_ms).map(|n| n as usize)
+}
+
+unsafe fn hid_ioctl(
+    h: HANDLE,
+    ev: HANDLE,
+    code: u32,
+    input: (*const c_void, u32),
+    output: (*mut c_void, u32),
+    timeout_ms: u32,
+) -> Option<u32> {
+    if ev.is_null() {
         return None;
     }
-    if WaitForSingleObject(ev, timeout_ms) == WAIT_OBJECT_0 {
-        let mut got = 0u32;
-        if GetOverlappedResult(h, &ov, &mut got, 0) != 0 {
-            Some(got as usize)
-        } else {
-            None
-        }
-    } else {
-        let _ = CancelIoEx(h, &ov);
-        let mut dummy = 0u32;
-        let _ = GetOverlappedResult(h, &ov, &mut dummy, 1);
-        None
-    }
-}
-
-fn copy_utf16_into_utf8(wbuf: &[u16], dst: &mut [u8; 64]) -> u8 {
-    let end = wbuf.iter().position(|&c| c == 0).unwrap_or(wbuf.len());
-    let mut pos = 0usize;
-    let mut tmp = [0u8; 4];
-    for r in char::decode_utf16(wbuf[..end].iter().copied()) {
-        let ch = r.unwrap_or('\u{FFFD}');
-        let s = ch.encode_utf8(&mut tmp).as_bytes();
-        if pos + s.len() > dst.len() {
-            break;
-        }
-        dst[pos..pos + s.len()].copy_from_slice(s);
-        pos += s.len();
-    }
-    // Trim leading/trailing ASCII whitespace
-    while pos > 0 && dst[pos - 1].is_ascii_whitespace() {
-        pos -= 1;
-    }
-    let mut start = 0usize;
-    while start < pos && dst[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    if start > 0 {
-        let len = pos - start;
-        dst.copy_within(start..pos, 0);
-        pos = len;
-    }
-    pos as u8
-}
-
-unsafe fn read_product_string(h: HANDLE, dst: &mut [u8; 64]) -> u8 {
-    let mut wbuf = [0u16; 128];
+    let _ = ResetEvent(ev);
+    let mut ov = OVERLAPPED::with_event(ev);
     let mut got = 0u32;
     if DeviceIoControl(
         h,
-        IOCTL_HID_GET_PRODUCT_STRING,
-        null(),
-        0,
-        wbuf.as_mut_ptr() as *mut c_void,
-        (wbuf.len() * 2) as u32,
+        code,
+        input.0,
+        input.1,
+        output.0,
+        output.1,
         &mut got,
-        null_mut(),
-    ) == 0
+        &mut ov,
+    ) != 0
     {
-        return 0;
+        return Some(got);
     }
-    let code_units = (got as usize / 2).min(wbuf.len());
-    copy_utf16_into_utf8(&wbuf[..code_units], dst)
+    finish_overlapped(h, ev, &ov, timeout_ms)
 }
 
 // ------------------------------------------------------- Logitech HID++ ---
@@ -455,46 +395,22 @@ unsafe fn hidpp_get_feature_index(h: HANDLE, ev: HANDLE, dev_idx: u8, feat_id: u
     }
 }
 
-unsafe fn hidpp_device_name(h: HANDLE, ev: HANDLE, dev_idx: u8, dst: &mut [u8; 64]) -> u8 {
+/// Check HID++ `0x0005` `func 2` (`getDeviceType`) so multi-device Unifying/Bolt
+/// receivers skip keyboards/keypads/remotes (`3 == Mouse`). Falls back to `true`
+/// if `0x0005` is unavailable.
+unsafe fn hidpp_is_mouse(h: HANDLE, ev: HANDLE, dev_idx: u8) -> bool {
     let Some(name_idx) = hidpp_get_feature_index(h, ev, dev_idx, 0x0005) else {
-        return 0;
+        return true;
     };
     let mut r = [0u8; 64];
-    let Some(n) = hidpp_request(h, ev, (dev_idx, name_idx, 0x00), &[], 250, &mut r) else {
-        return 0;
+    let Some(n) = hidpp_request(h, ev, (dev_idx, name_idx, 0x02), &[], 250, &mut r) else {
+        return true;
     };
-    if n < 5 {
-        return 0;
+    if n >= 5 {
+        r[4] == 3
+    } else {
+        true
     }
-    let total_len = (r[4] as usize).min(dst.len());
-    if total_len == 0 {
-        return 0;
-    }
-    let mut offset = 0usize;
-    while offset < total_len {
-        let Some(cn) = hidpp_request(
-            h,
-            ev,
-            (dev_idx, name_idx, 0x01),
-            &[offset as u8],
-            250,
-            &mut r,
-        ) else {
-            return 0;
-        };
-        if cn <= 4 {
-            break;
-        }
-        let payload = &r[4..cn];
-        let copy_len = payload.len().min(total_len - offset);
-        dst[offset..offset + copy_len].copy_from_slice(&payload[..copy_len]);
-        offset += copy_len;
-    }
-    let mut len = offset.min(total_len);
-    while len > 0 && (dst[len - 1] == 0 || dst[len - 1].is_ascii_whitespace()) {
-        len -= 1;
-    }
-    len as u8
 }
 
 unsafe fn hidpp_read_battery(
@@ -530,18 +446,6 @@ fn logitech_dev_indices(pid: u16) -> &'static [u8] {
     }
 }
 
-unsafe fn set_logitech_fallback_name(h: HANDLE, out: &mut Battery) {
-    let plen = read_product_string(h, &mut out.name);
-    let ps = core::str::from_utf8(&out.name[..plen as usize]).unwrap_or("");
-    if plen == 0 || ps == "USB Receiver" || ps == "LIGHTSPEED Receiver" {
-        let fb = b"Souris Logitech";
-        out.name[..fb.len()].copy_from_slice(fb);
-        out.name_len = fb.len() as u8;
-    } else {
-        out.name_len = plen;
-    }
-}
-
 // -------------------------------------------------------------- HyperX ---
 
 unsafe fn hyperx_transact(
@@ -555,21 +459,18 @@ unsafe fn hyperx_transact(
     out[0] = 0x66;
     out[1] = cmd;
 
-    if !send_report(h, ev, &out, timeout_ms) {
-        let mut dummy = 0u32;
-        if DeviceIoControl(
+    if !send_report(h, ev, &out, timeout_ms)
+        && hid_ioctl(
             h,
+            ev,
             IOCTL_HID_SET_FEATURE,
-            out.as_ptr() as *const c_void,
-            out.len() as u32,
-            null_mut(),
-            0,
-            &mut dummy,
-            null_mut(),
-        ) == 0
-        {
-            return None;
-        }
+            (out.as_ptr() as *const c_void, out.len() as u32),
+            (null_mut(), 0),
+            timeout_ms,
+        )
+        .is_none()
+    {
+        return None;
     }
 
     let deadline = GetTickCount64().wrapping_add(timeout_ms as u64);
@@ -586,12 +487,7 @@ unsafe fn hyperx_transact(
     }
 }
 
-unsafe fn hyperx_read_handle(
-    h: HANDLE,
-    ev: HANDLE,
-    name: &[u8; 64],
-    name_len: u8,
-) -> Option<Battery> {
+unsafe fn hyperx_read_handle(h: HANDLE, ev: HANDLE) -> Option<Battery> {
     let mut pkt = [0u8; 64];
     let n = hyperx_transact(h, ev, 0x89, 500, &mut pkt)?;
     let pct = parse_hyperx_battery(&pkt[..n])?;
@@ -605,29 +501,22 @@ unsafe fn hyperx_read_handle(
         }
         None => (false, false),
     };
-    let mut b = Battery::new(Kind::Headset, pct, charging, online);
-    b.name = *name;
-    b.name_len = name_len;
-    Some(b)
+    Some(Battery::new(Kind::Headset, pct, charging, online))
 }
 
 // -------------------------------------------------------- Cached scanner ----
 
 #[derive(Clone, Copy)]
 struct LogitechEndpoint {
-    path: HidPath,
+    cand_idx: u8,
     dev_idx: u8,
-    name: [u8; 64],
-    name_len: u8,
     batt_feat_id: u16,
     batt_feat_idx: u8,
 }
 
 #[derive(Clone, Copy)]
 struct HyperXEndpoint {
-    path: HidPath,
-    name: [u8; 64],
-    name_len: u8,
+    active: bool,
 }
 
 /// Stateful, allocation-free HID scanner caching active endpoints, sleeping candidates,
@@ -650,12 +539,7 @@ impl Default for HidScanner {
 
 impl Drop for HidScanner {
     fn drop(&mut self) {
-        if !self.io_event.is_null() {
-            unsafe {
-                let _ = CloseHandle(self.io_event);
-            }
-            self.io_event = null_mut();
-        }
+        self.close();
     }
 }
 
@@ -669,6 +553,29 @@ impl HidScanner {
             cached_logi_count: 0,
             cached_logi: [CachedCandidate::empty(); LOGI_CAND_CAP],
             cached_hyperx: None,
+        }
+    }
+
+    /// Initialize `HidScanner` directly in static `.bss` storage without stack temporaries.
+    ///
+    /// # Safety
+    /// `dst` must point to valid zero-initialized memory for `Self`.
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        addr_of_mut!((*dst).io_event).write(null_mut());
+        addr_of_mut!((*dst).logitech).write(None);
+        addr_of_mut!((*dst).hyperx).write(None);
+        addr_of_mut!((*dst).candidates_cached).write(false);
+        addr_of_mut!((*dst).cached_logi_count).write(0);
+        addr_of_mut!((*dst).cached_hyperx).write(None);
+    }
+
+    /// Release cached `io_event` handle cleanly in place without moving `Self`.
+    pub fn close(&mut self) {
+        if !self.io_event.is_null() {
+            unsafe {
+                let _ = CloseHandle(self.io_event);
+            }
+            self.io_event = null_mut();
         }
     }
 
@@ -694,66 +601,81 @@ impl HidScanner {
             return results;
         }
 
+        let mut skip_logi_discover = false;
+        let mut skip_hyperx_discover = false;
+
         // 1. Poll cached Logitech endpoint if present
         if let Some(ep) = self.logitech {
-            unsafe {
-                if let Some(h) = open_hid(ep.path.buf.as_ptr()) {
-                    if let Some((pct, charging)) =
-                        hidpp_read_battery(h, ev, ep.dev_idx, ep.batt_feat_id, ep.batt_feat_idx)
-                    {
-                        let mut b = Battery::new(Kind::Mouse, Some(pct), charging, true);
-                        b.name = ep.name;
-                        b.name_len = ep.name_len;
-                        results.set(b);
+            let idx = ep.cand_idx as usize;
+            if idx < self.cached_logi_count as usize {
+                unsafe {
+                    if let Some(h) = open_hid(self.cached_logi[idx].path.buf.as_ptr()) {
+                        if let Some((pct, charging)) =
+                            hidpp_read_battery(h, ev, ep.dev_idx, ep.batt_feat_id, ep.batt_feat_idx)
+                        {
+                            results.set(Battery::new(Kind::Mouse, Some(pct), charging, true));
+                        }
+                        let _ = CloseHandle(h);
+                    } else {
+                        self.logitech = None;
+                        self.candidates_cached = false;
+                        skip_logi_discover = true;
                     }
-                    let _ = CloseHandle(h);
-                } else {
-                    self.logitech = None;
                 }
+            } else {
+                self.logitech = None;
             }
         }
 
         // 2. Poll cached HyperX endpoint if present
         if let Some(ep) = self.hyperx {
-            unsafe {
-                if let Some(h) = open_hid(ep.path.buf.as_ptr()) {
-                    if let Some(b) = hyperx_read_handle(h, ev, &ep.name, ep.name_len) {
-                        results.set(b);
-                    } else {
-                        self.hyperx = None;
+            if ep.active {
+                if let Some(ref cand) = self.cached_hyperx {
+                    unsafe {
+                        if let Some(h) = open_hid(cand.path.buf.as_ptr()) {
+                            if let Some(b) = hyperx_read_handle(h, ev) {
+                                results.set(b);
+                            } else {
+                                self.hyperx = None;
+                                self.candidates_cached = false;
+                                skip_hyperx_discover = true;
+                            }
+                            let _ = CloseHandle(h);
+                        } else {
+                            self.hyperx = None;
+                            self.candidates_cached = false;
+                            skip_hyperx_discover = true;
+                        }
                     }
-                    let _ = CloseHandle(h);
                 } else {
                     self.hyperx = None;
                 }
             }
         }
 
-        // 3. Discover any missing device kind (enumerate Raw Input only when needed)
-        if self.logitech.is_none() || self.hyperx.is_none() {
-            unsafe { self.discover_missing(ev, &mut results) };
+        // 3. Discover missing devices without blocking again on a device that just failed
+        let need_logi = self.logitech.is_none() && !skip_logi_discover;
+        let need_hyperx = self.hyperx.is_none() && !skip_hyperx_discover;
+        if need_logi || need_hyperx {
+            unsafe { self.discover_missing(ev, need_logi, need_hyperx, &mut results) };
         }
 
         results
     }
 
+    #[inline(never)]
     unsafe fn refresh_raw_candidates(&mut self) {
         self.cached_logi_count = 0;
         self.cached_hyperx = None;
-        self.candidates_cached = true;
 
         let elem_size = core::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
-        let mut count = 0u32;
-        if GetRawInputDeviceList(null_mut(), &mut count, elem_size) == u32::MAX || count == 0 {
-            return;
-        }
-
         let mut list = [RAWINPUTDEVICELIST::default(); RAW_LIST_CAP];
-        let mut cap = list.len().min(count as usize) as u32;
+        let mut cap = list.len() as u32;
         let got = GetRawInputDeviceList(list.as_mut_ptr(), &mut cap, elem_size);
         if got == u32::MAX {
             return;
         }
+        self.candidates_cached = true;
 
         for item in &list[..got as usize] {
             if item.dw_type != RIM_TYPEHID {
@@ -774,22 +696,20 @@ impl HidScanner {
             let vid = h.dw_vendor_id as u16;
             let pid = h.dw_product_id as u16;
             let is_logi = vid == 0x046D && h.us_usage_page == 0xFF00 && h.us_usage == 0x0002;
-            let is_hyperx =
-                vid == 0x03F0 && pid == 0x05B7 && h.us_usage_page == 0xFF13;
+            let is_hyperx = vid == 0x03F0 && pid == 0x05B7 && h.us_usage_page == 0xFF13;
             if !is_logi && !is_hyperx {
                 continue;
             }
 
             let mut path = HidPath::empty();
             let mut char_len = HID_PATH_CAP as u32;
-            if GetRawInputDeviceInfoW(
+            let res = GetRawInputDeviceInfoW(
                 item.h_device,
                 RIDI_DEVICENAME,
                 path.buf.as_mut_ptr() as *mut c_void,
                 &mut char_len,
-            ) == u32::MAX
-                || char_len == 0
-            {
+            );
+            if res == u32::MAX || res == 0 {
                 continue;
             }
             path.buf[HID_PATH_CAP - 1] = 0;
@@ -803,33 +723,46 @@ impl HidScanner {
         }
 
         // Prioritize single-device LIGHTSPEED receivers before multi-device Unifying/Bolt receivers
-        if self.cached_logi_count == 2 {
-            let is_single = |pid: u16| {
-                matches!(
-                    pid,
-                    0xC539 | 0xC53A | 0xC53F | 0xC541 | 0xC545 | 0xC547
-                )
-            };
-            if !is_single(self.cached_logi[0].pid) && is_single(self.cached_logi[1].pid) {
-                self.cached_logi.swap(0, 1);
+        let is_single = |pid: u16| {
+            matches!(
+                pid,
+                0xC539 | 0xC53A | 0xC53F | 0xC541 | 0xC545 | 0xC547
+            )
+        };
+        let n = self.cached_logi_count as usize;
+        for i in 1..n {
+            let mut j = i;
+            while j > 0
+                && is_single(self.cached_logi[j].pid)
+                && !is_single(self.cached_logi[j - 1].pid)
+            {
+                self.cached_logi.swap(j - 1, j);
+                j -= 1;
             }
         }
     }
 
-    unsafe fn discover_missing(&mut self, ev: HANDLE, results: &mut BatteryList) {
+    unsafe fn discover_missing(
+        &mut self,
+        ev: HANDLE,
+        need_logi: bool,
+        need_hyperx: bool,
+        results: &mut BatteryList,
+    ) {
         if !self.candidates_cached {
             self.refresh_raw_candidates();
         }
 
-        if self.logitech.is_none() {
+        if need_logi && self.logitech.is_none() {
             let n = self.cached_logi_count as usize;
             for i in 0..n {
-                let cand = self.cached_logi[i];
-                let Some(handle) = open_hid(cand.path.buf.as_ptr()) else {
+                let path_ptr = self.cached_logi[i].path.buf.as_ptr();
+                let pid = self.cached_logi[i].pid;
+                let Some(handle) = open_hid(path_ptr) else {
                     self.candidates_cached = false;
                     continue;
                 };
-                let indices = logitech_dev_indices(cand.pid);
+                let indices = logitech_dev_indices(pid);
                 let ping_timeout = if indices.len() == 1 { 250 } else { 120 };
 
                 let mut found = false;
@@ -837,9 +770,13 @@ impl HidScanner {
                     if !hidpp_ping(handle, ev, dev_idx, ping_timeout) {
                         continue;
                     }
+                    if indices.len() > 1 && !hidpp_is_mouse(handle, ev, dev_idx) {
+                        continue;
+                    }
                     let mut found_feat = None;
                     for feat_id in [0x1004u16, 0x1000u16, 0x1001u16] {
-                        if let Some(feat_idx) = hidpp_get_feature_index(handle, ev, dev_idx, feat_id)
+                        if let Some(feat_idx) =
+                            hidpp_get_feature_index(handle, ev, dev_idx, feat_id)
                         {
                             found_feat = Some((feat_id, feat_idx));
                             break;
@@ -851,20 +788,13 @@ impl HidScanner {
                     if let Some((pct, charging)) =
                         hidpp_read_battery(handle, ev, dev_idx, batt_feat_id, batt_feat_idx)
                     {
-                        let mut b = Battery::new(Kind::Mouse, Some(pct), charging, true);
-                        b.name_len = hidpp_device_name(handle, ev, dev_idx, &mut b.name);
-                        if b.name_len == 0 {
-                            set_logitech_fallback_name(handle, &mut b);
-                        }
                         self.logitech = Some(LogitechEndpoint {
-                            path: cand.path,
+                            cand_idx: i as u8,
                             dev_idx,
-                            name: b.name,
-                            name_len: b.name_len,
                             batt_feat_id,
                             batt_feat_idx,
                         });
-                        results.set(b);
+                        results.set(Battery::new(Kind::Mouse, Some(pct), charging, true));
                         found = true;
                         break;
                     }
@@ -876,22 +806,11 @@ impl HidScanner {
             }
         }
 
-        if self.hyperx.is_none() {
-            if let Some(cand) = self.cached_hyperx {
+        if need_hyperx && self.hyperx.is_none() {
+            if let Some(ref cand) = self.cached_hyperx {
                 if let Some(handle) = open_hid(cand.path.buf.as_ptr()) {
-                    let mut name = [0u8; 64];
-                    let mut name_len = read_product_string(handle, &mut name);
-                    if name_len == 0 {
-                        let fb = b"HyperX Cloud III Wireless";
-                        name[..fb.len()].copy_from_slice(fb);
-                        name_len = fb.len() as u8;
-                    }
-                    if let Some(b) = hyperx_read_handle(handle, ev, &name, name_len) {
-                        self.hyperx = Some(HyperXEndpoint {
-                            path: cand.path,
-                            name,
-                            name_len,
-                        });
+                    if let Some(b) = hyperx_read_handle(handle, ev) {
+                        self.hyperx = Some(HyperXEndpoint { active: true });
                         results.set(b);
                     }
                     let _ = CloseHandle(handle);
@@ -907,6 +826,8 @@ impl HidScanner {
 pub fn read_all() -> BatteryList {
     HidScanner::new().poll(true)
 }
+
+// -------------------------------------------------- CLI diagnostics (poc) ---
 
 #[derive(Clone, Copy)]
 pub struct RawCandidate {
@@ -935,12 +856,8 @@ pub fn probe_raw_candidates() -> ([RawCandidate; 4], usize) {
     let mut out_n = 0usize;
     unsafe {
         let elem_size = core::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
-        let mut count = 0u32;
-        if GetRawInputDeviceList(null_mut(), &mut count, elem_size) == u32::MAX || count == 0 {
-            return (out, 0);
-        }
         let mut list = [RAWINPUTDEVICELIST::default(); RAW_LIST_CAP];
-        let mut cap = list.len().min(count as usize) as u32;
+        let mut cap = list.len() as u32;
         let got = GetRawInputDeviceList(list.as_mut_ptr(), &mut cap, elem_size);
         if got == u32::MAX {
             return (out, 0);
@@ -970,14 +887,14 @@ pub fn probe_raw_candidates() -> ([RawCandidate; 4], usize) {
             }
             let mut path = HidPath::empty();
             let mut char_len = HID_PATH_CAP as u32;
-            if GetRawInputDeviceInfoW(
+            let res = GetRawInputDeviceInfoW(
                 item.h_device,
                 RIDI_DEVICENAME,
                 path.buf.as_mut_ptr() as *mut c_void,
                 &mut char_len,
-            ) != u32::MAX
-                && out_n < out.len()
-            {
+            );
+            if res != u32::MAX && res != 0 && out_n < out.len() {
+                path.buf[HID_PATH_CAP - 1] = 0;
                 out[out_n] = RawCandidate {
                     path,
                     vid,
@@ -990,6 +907,28 @@ pub fn probe_raw_candidates() -> ([RawCandidate; 4], usize) {
         }
     }
     (out, out_n)
+}
+
+/// Read USB HID product string via overlapped `IOCTL_HID_GET_PRODUCT_STRING` (for `poc`).
+///
+/// # Safety
+/// `h` must be an opened HID HANDLE and `ev` a valid manual-reset event HANDLE.
+pub unsafe fn probe_product_string_utf16(h: HANDLE, ev: HANDLE, out: &mut [u16; 128]) -> usize {
+    let Some(got) = hid_ioctl(
+        h,
+        ev,
+        IOCTL_HID_GET_PRODUCT_STRING,
+        (null(), 0),
+        (out.as_mut_ptr() as *mut c_void, (out.len() * 2) as u32),
+        300,
+    ) else {
+        return 0;
+    };
+    let units = (got as usize / 2).min(out.len());
+    out[..units]
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(units)
 }
 
 #[cfg(test)]
@@ -1018,19 +957,45 @@ mod tests {
         assert_eq!(match_hidpp_reply(&wrong_feat, 1, 7, 0), MatchReply::Ignore);
 
         let err20 = [0x11, 0x01, 0xFF, 0x07, HIDPP_SW_ID, 0x02];
-        assert_eq!(match_hidpp_reply(&err20, 1, 7, 0), MatchReply::ProtocolError);
+        assert_eq!(
+            match_hidpp_reply(&err20, 1, 7, 0),
+            MatchReply::ProtocolError
+        );
 
-        let err10 = [0x11, 0x01, 0x8F, 0x00, 0x00, 0x08];
-        assert_eq!(match_hidpp_reply(&err10, 1, 0, 1), MatchReply::ProtocolError);
+        let err10_ours = [0x11, 0x01, 0x8F, 0x07, HIDPP_SW_ID, 0x08];
+        assert_eq!(
+            match_hidpp_reply(&err10_ours, 1, 7, 0),
+            MatchReply::ProtocolError
+        );
+
+        // HID++ 1.0 error from G HUB (different sw_id) must be ignored
+        let err10_other = [0x11, 0x01, 0x8F, 0x07, 0x01, 0x08];
+        assert_eq!(match_hidpp_reply(&err10_other, 1, 7, 0), MatchReply::Ignore);
     }
 
     #[test]
     fn logitech_battery_parsers() {
-        assert_eq!(parse_1004_status(&[0x11, 1, 5, 0x1A, 86, 0x04, 1]), Some((86, true)));
-        assert_eq!(parse_1004_status(&[0x11, 1, 5, 0x1A, 100, 0x04, 3]), Some((100, false)));
+        assert_eq!(
+            parse_1004_status(&[0x11, 1, 5, 0x1A, 86, 0x04, 1]),
+            Some((86, true))
+        );
+        assert_eq!(
+            parse_1004_status(&[0x11, 1, 5, 0x1A, 40, 0x04, 4]),
+            Some((40, true))
+        );
+        assert_eq!(
+            parse_1004_status(&[0x11, 1, 5, 0x1A, 100, 0x04, 3]),
+            Some((100, false))
+        );
 
-        assert_eq!(parse_1000_status(&[0x11, 1, 5, 0x0A, 45, 40, 4]), Some((45, true)));
-        assert_eq!(parse_1000_status(&[0x11, 1, 5, 0x0A, 45, 40, 0]), Some((45, false)));
+        assert_eq!(
+            parse_1000_status(&[0x11, 1, 5, 0x0A, 45, 40, 4]),
+            Some((45, true))
+        );
+        assert_eq!(
+            parse_1000_status(&[0x11, 1, 5, 0x0A, 45, 40, 0]),
+            Some((45, false))
+        );
 
         let mv = 4067u16.to_be_bytes();
         assert_eq!(
@@ -1045,9 +1010,18 @@ mod tests {
 
     #[test]
     fn hyperx_battery_and_charging_parsers() {
-        assert_eq!(parse_hyperx_battery(&[0x66, 0x89, 0x0F, 0xEB, 0x5D]), Some(Some(93)));
-        assert_eq!(parse_hyperx_battery(&[0x66, 0x89, 0x00, 0x00, 0x00]), Some(None));
-        assert_eq!(parse_hyperx_battery(&[0x66, 0x8A, 0x01, 0x00, 0x00]), None);
+        assert_eq!(
+            parse_hyperx_battery(&[0x66, 0x89, 0x0F, 0xEB, 0x5D]),
+            Some(Some(93))
+        );
+        assert_eq!(
+            parse_hyperx_battery(&[0x66, 0x89, 0x00, 0x00, 0x00]),
+            Some(None)
+        );
+        assert_eq!(
+            parse_hyperx_battery(&[0x66, 0x8A, 0x01, 0x00, 0x00]),
+            None
+        );
 
         assert_eq!(parse_hyperx_charging(&[0x66, 0x8A, 0x01]), Some(true));
         assert_eq!(parse_hyperx_charging(&[0x66, 0x8A, 0x00]), Some(false));

@@ -301,7 +301,7 @@ pub const IOCTL_HID_SET_FEATURE: u32 = 0x000B_0191;
 pub const IOCTL_HID_GET_PRODUCT_STRING: u32 = 0x000B_01BE;
 
 pub const HKEY_CURRENT_USER: isize = (-2147483647i32) as isize;
-pub const RRF_RT_ANY: u32 = 0x0000_FFFF;
+pub const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
 
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
@@ -324,12 +324,14 @@ pub const ULW_ALPHA: u32 = 0x0000_0002;
 
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
+pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
 pub const WM_DISPLAYCHANGE: u32 = 0x007E;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_POWERBROADCAST: u32 = 0x0218;
 pub const WM_DEVICECHANGE: u32 = 0x0219;
+pub const WM_DPICHANGED: u32 = 0x02E0;
 pub const PBT_APMRESUMESUSPEND: usize = 0x0007;
 pub const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 
@@ -350,10 +352,10 @@ pub const DIB_RGB_COLORS: u32 = 0;
 pub const AC_SRC_OVER: u8 = 0;
 pub const AC_SRC_ALPHA: u8 = 1;
 pub const TRANSPARENT: i32 = 1;
-pub const DEFAULT_CHARSET: i32 = 1;
-pub const OUT_DEFAULT_PRECIS: i32 = 0;
-pub const CLIP_DEFAULT_PRECIS: i32 = 0;
-pub const ANTIALIASED_QUALITY: i32 = 4;
+pub const DEFAULT_CHARSET: u32 = 1;
+pub const OUT_DEFAULT_PRECIS: u32 = 0;
+pub const CLIP_DEFAULT_PRECIS: u32 = 0;
+pub const ANTIALIASED_QUALITY: u32 = 4;
 
 pub const DT_RIGHT: u32 = 0x0002;
 pub const DT_CENTER: u32 = 0x0001;
@@ -513,7 +515,6 @@ extern "system" {
         flags: u32,
     ) -> BOOL;
     pub fn GetDpiForWindow(hwnd: HWND) -> u32;
-    pub fn GetDpiForSystem() -> u32;
     pub fn MonitorFromWindow(hwnd: HWND, flags: u32) -> HMONITOR;
     pub fn GetMonitorInfoW(hmon: HMONITOR, lpmi: *mut MONITORINFO) -> BOOL;
     pub fn GetRawInputDeviceList(
@@ -556,10 +557,10 @@ extern "system" {
         italic: u32,
         underline: u32,
         strike: u32,
-        charset: i32,
-        out_precis: i32,
-        clip_precis: i32,
-        quality: i32,
+        charset: u32,
+        out_precis: u32,
+        clip_precis: u32,
+        quality: u32,
         pitch: u32,
         face: *const u16,
     ) -> HFONT;

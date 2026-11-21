@@ -45,9 +45,10 @@ Ultra-minimal `#![no_std]` + `#![no_main]` single-threaded native Windows 11 tas
 ## Critical Win32 & Concurrency Invariants
 1. **Never use `HWND_MESSAGE` for the main hidden window**: Windows does not deliver broadcast messages (`WM_SETTINGCHANGE`, `TaskbarCreated`, `WM_DEVICECHANGE`, `WM_POWERBROADCAST`) to message-only windows. Always create an unshown top-level window, and handle both `WM_CLOSE` and `WM_DESTROY` idempotently.
 2. **Never hold mutable references or re-enter across Win32 calls**: Snapshot/take `WidgetWindow` from `APP`, drop borrows, guard with `syncing`/`polling` flags, then call Win32 (`DestroyWindow` / `sync_position`). Read `LAST_OWNER_ATTEMPT` by value before `DestroyWindow`.
-3. **Always pass valid `OVERLAPPED` on `FILE_FLAG_OVERLAPPED` handles & retire cancelled I/O**: Use `hid_ioctl` / `send_report` / `recv_report` with `ResetEvent(io_event)` before every `WriteFile`/`ReadFile`/`DeviceIoControl`, and after `CancelIoEx(h, &ov)`, ALWAYS call `GetOverlappedResult(h, &ov, &mut got, 1)` before returning.
+3. **Always pass valid mutable `*mut OVERLAPPED` on `FILE_FLAG_OVERLAPPED` handles & retire cancelled I/O**: Use `hid_ioctl` / `send_report` / `recv_report` with `ResetEvent(io_event)` before every `WriteFile`/`ReadFile`/`DeviceIoControl`, pass `*mut OVERLAPPED` (never `&OVERLAPPED`, so LLVM cannot assume kernel-mutated memory is `readonly`), and after `CancelIoEx(h, ov)`, ALWAYS call `GetOverlappedResult(h, ov, &mut got, 1)` before returning.
 4. **Never use ClearType or luminance-to-alpha**: Render white-on-black with `ANTIALIASED_QUALITY`, average grayscale coverage into alpha, and premultiply monochrome BGRA in-place before `UpdateLayeredWindow`.
 5. **Zero handle/GDI leaks**: Restore old DC selections (`old_bmp`, `old_font`) and destroy DIBs, DCs, `FontCache` `HFONT`s, `io_event` (`HidScanner::close`), `HWINEVENTHOOK`s, and `instance_mutex` cleanly on exit.
+6. **Keep `HidPath` 4-byte aligned (`#[repr(align(4))]`)**: `win32k!NtUserGetRawInputDeviceInfo` probes the output buffer for 4-byte alignment even on `RIDI_DEVICENAME` (`[u16; 256]`) and fails with `ERROR_NOACCESS` (`998`) if `opt-level = "z"` packs a 2-byte-aligned `[u16; 256]` stack local at `addr % 4 == 2`.
 
 ---
 

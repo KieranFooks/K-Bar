@@ -411,10 +411,10 @@ extern "system" {
     ) -> HANDLE;
     pub fn ResetEvent(h: HANDLE) -> BOOL;
     pub fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
-    pub fn CancelIoEx(h: HANDLE, ov: *const OVERLAPPED) -> BOOL;
+    pub fn CancelIoEx(h: HANDLE, ov: *mut OVERLAPPED) -> BOOL;
     pub fn GetOverlappedResult(
         h: HANDLE,
-        ov: *const OVERLAPPED,
+        ov: *mut OVERLAPPED,
         transferred: *mut u32,
         wait: BOOL,
     ) -> BOOL;

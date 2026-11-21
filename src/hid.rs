@@ -199,10 +199,18 @@ pub fn parse_hyperx_charging(r: &[u8]) -> Option<bool> {
 
 // ------------------------------------------------------------ HID helpers ---
 
+/// 4-byte-aligned UTF-16 device interface path buffer.
+///
+/// `win32k!NtUserGetRawInputDeviceInfo` probes the output buffer for 4-byte alignment
+/// even on `RIDI_DEVICENAME`, failing with `ERROR_NOACCESS` (`998`) when `opt-level = "z"`
+/// packs a `#[repr(align(2))]` `[u16; 256]` stack local at `addr % 4 == 2`.
 #[derive(Clone, Copy)]
+#[repr(align(4))]
 pub struct HidPath {
     pub buf: [u16; HID_PATH_CAP],
 }
+
+const _: () = assert!(core::mem::align_of::<HidPath>() >= 4);
 
 impl HidPath {
     pub const fn empty() -> Self {
@@ -253,7 +261,7 @@ unsafe fn open_hid(path: *const u16) -> Option<HANDLE> {
     }
 }
 
-unsafe fn finish_overlapped(h: HANDLE, ev: HANDLE, ov: &OVERLAPPED, timeout_ms: u32) -> Option<u32> {
+unsafe fn finish_overlapped(h: HANDLE, ev: HANDLE, ov: *mut OVERLAPPED, timeout_ms: u32) -> Option<u32> {
     if GetLastError() != ERROR_IO_PENDING {
         return None;
     }
@@ -282,7 +290,7 @@ unsafe fn send_report(h: HANDLE, ev: HANDLE, buf: &[u8], timeout_ms: u32) -> boo
     if WriteFile(h, buf.as_ptr(), buf.len() as u32, &mut written, &mut ov) != 0 {
         return true;
     }
-    finish_overlapped(h, ev, &ov, timeout_ms).is_some()
+    finish_overlapped(h, ev, &mut ov, timeout_ms).is_some()
 }
 
 unsafe fn recv_report(h: HANDLE, ev: HANDLE, timeout_ms: u32, out: &mut [u8; 64]) -> Option<usize> {
@@ -296,7 +304,7 @@ unsafe fn recv_report(h: HANDLE, ev: HANDLE, timeout_ms: u32, out: &mut [u8; 64]
     if ReadFile(h, out.as_mut_ptr(), out.len() as u32, &mut read, &mut ov) != 0 {
         return Some(read as usize);
     }
-    finish_overlapped(h, ev, &ov, timeout_ms).map(|n| n as usize)
+    finish_overlapped(h, ev, &mut ov, timeout_ms).map(|n| n as usize)
 }
 
 unsafe fn hid_ioctl(
@@ -326,7 +334,7 @@ unsafe fn hid_ioctl(
     {
         return Some(got);
     }
-    finish_overlapped(h, ev, &ov, timeout_ms)
+    finish_overlapped(h, ev, &mut ov, timeout_ms)
 }
 
 // ------------------------------------------------------- Logitech HID++ ---
@@ -1025,5 +1033,43 @@ mod tests {
 
         assert_eq!(parse_hyperx_charging(&[0x66, 0x8A, 0x01]), Some(true));
         assert_eq!(parse_hyperx_charging(&[0x66, 0x8A, 0x00]), Some(false));
+    }
+
+    #[test]
+    fn hid_path_is_4_byte_aligned_for_raw_input() {
+        assert!(core::mem::align_of::<HidPath>() >= 4);
+
+        let mut pair = core::hint::black_box((1u16, HidPath::empty()));
+        assert_eq!(pair.0, 1);
+        let addr = pair.1.buf.as_ptr() as usize;
+        assert_eq!(addr & 3, 0, "HidPath must be 4-byte aligned, got {addr:#x}");
+
+        unsafe {
+            let elem_size = core::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
+            let mut list = [RAWINPUTDEVICELIST::default(); RAW_LIST_CAP];
+            let mut cap = list.len() as u32;
+            let got = GetRawInputDeviceList(list.as_mut_ptr(), &mut cap, elem_size);
+            if got != u32::MAX {
+                if let Some(item) = list[..got as usize]
+                    .iter()
+                    .find(|d| d.dw_type == RIM_TYPEHID)
+                {
+                    let mut char_len = HID_PATH_CAP as u32;
+                    let res = GetRawInputDeviceInfoW(
+                        item.h_device,
+                        RIDI_DEVICENAME,
+                        pair.1.buf.as_mut_ptr() as *mut c_void,
+                        &mut char_len,
+                    );
+                    assert_ne!(
+                        res,
+                        u32::MAX,
+                        "RIDI_DEVICENAME failed (err={})",
+                        GetLastError()
+                    );
+                    assert!(res > 0);
+                }
+            }
+        }
     }
 }

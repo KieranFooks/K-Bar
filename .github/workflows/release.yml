@@ -178,15 +178,27 @@ jobs:
           2. Double-click to run directly (no installer, no archive, zero external dependencies).
              *(If Windows SmartScreen prompts on first launch of an unsigned binary, click **More info → Run anyway**.)*
 
-          #### Optional: Install & Run at Windows Startup (PowerShell)
+          #### Optional: Install / Update & Run at Windows Startup (PowerShell)
           ```powershell
-          $dst = "$env:LOCALAPPDATA\Programs\katt\katt.exe"
-          New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+          $dir = "$env:LOCALAPPDATA\Programs\katt"
+          $dst = "$dir\katt.exe"
+          Stop-Process -Name katt, katt-dev -ErrorAction SilentlyContinue
+          Start-Sleep -Milliseconds 300
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Remove-Item "$dir\katt.exe.old", "$dir\katt.exe.new", "$dir\katt-dev.exe" -Force -ErrorAction SilentlyContinue
           Invoke-WebRequest "https://github.com/__REPO__/releases/download/__TAG__/katt.exe" -OutFile $dst
           Unblock-File $dst
           Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -Value "`"$dst`""
-          Stop-Process -Name katt -ErrorAction SilentlyContinue
           Start-Process $dst
+          ```
+
+          #### Stop & Clean Up / Uninstall (PowerShell)
+          ```powershell
+          Stop-Process -Name katt, katt-dev -ErrorAction SilentlyContinue
+          Start-Sleep -Milliseconds 300
+          Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -ErrorAction SilentlyContinue
+          Remove-Item "HKCU:\Software\katt" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:LOCALAPPDATA\Programs\katt" -Recurse -Force -ErrorAction SilentlyContinue
           ```
 
           **SHA-256 (`katt.exe`):** `__SHA256__`

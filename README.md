@@ -33,23 +33,28 @@ Download the latest single-file portable executable (40 KB, zero dependencies, n
 
 Double-click `katt.exe` to run it immediately. *(On first launch of an unsigned binary, Windows SmartScreen may ask for confirmation: **More info → Run anyway**.)*
 
-### Optional: One-Line Install & Windows Startup (PowerShell)
+### Optional: One-Line Install / Update & Windows Startup (PowerShell)
 
 ```powershell
-$dst = "$env:LOCALAPPDATA\Programs\katt\katt.exe"
-New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+$dir = "$env:LOCALAPPDATA\Programs\katt"
+$dst = "$dir\katt.exe"
+Stop-Process -Name katt, katt-dev -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+New-Item -ItemType Directory -Force $dir | Out-Null
+Remove-Item "$dir\katt.exe.old", "$dir\katt.exe.new", "$dir\katt-dev.exe" -Force -ErrorAction SilentlyContinue
 Invoke-WebRequest "https://github.com/KieranFooks/katt/releases/latest/download/katt.exe" -OutFile $dst
 Unblock-File $dst
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -Value "`"$dst`""
-Stop-Process -Name katt -ErrorAction SilentlyContinue
 Start-Process $dst
 ```
 
-Uninstall cleanly:
+Stop & uninstall cleanly:
 
 ```powershell
-Stop-Process -Name katt -ErrorAction SilentlyContinue
+Stop-Process -Name katt, katt-dev -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
 Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -ErrorAction SilentlyContinue
+Remove-Item "HKCU:\Software\katt" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:LOCALAPPDATA\Programs\katt" -Recurse -Force -ErrorAction SilentlyContinue
 ```
 

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-verify:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Expose MSYS2 binutils for windres
+        run: |
+          if (Test-Path "C:\msys64\mingw64\bin") {
+            "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Lint and unit tests
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Build portable release binary and verify PE
+        run: |
+          $ver = (Get-Date).ToUniversalTime().ToString("yyyy.MM.dd")
+          $env:BATTERY_TRAY_VERSION = $ver
+          cargo build --release --locked
+          & "$PWD/tools/verify_portable.ps1" -Path "target\release\battery-tray.exe" -ExpectedVersion $ver

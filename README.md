@@ -23,7 +23,35 @@ Minimalist `#![no_std]` + `#![no_main]` native Windows 11 utility (zero external
 | Threads | **2** (UI + background HID/BT poller) |
 | UI guard timer | **1,000 ms** (event-driven hooks) |
 
-## Build & Run
+## Download & Run (Portable `.exe`)
+
+Download the latest single-file portable executable (~40 KB, zero dependencies, no installer) from [GitHub Releases](https://github.com/KieranFooks/K-Bar/releases/latest):
+
+- **Direct download**: [`battery-tray.exe`](https://github.com/KieranFooks/K-Bar/releases/latest/download/battery-tray.exe) (CalVer releases `vYYYY.MM.DD`)
+
+Double-click `battery-tray.exe` to run it immediately. *(On first launch of an unsigned binary, Windows SmartScreen may ask for confirmation: **More info → Run anyway**.)*
+
+### Optional: One-Line Install & Windows Startup (PowerShell)
+
+```powershell
+$dst = "$env:LOCALAPPDATA\Programs\battery-tray\battery-tray.exe"
+New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+Invoke-WebRequest "https://github.com/KieranFooks/K-Bar/releases/latest/download/battery-tray.exe" -OutFile $dst
+Unblock-File $dst
+Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray" -Value "`"$dst`""
+Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
+Start-Process $dst
+```
+
+Uninstall cleanly:
+
+```powershell
+Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
+Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray" -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\Programs\battery-tray" -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+## Build from Source
 
 Requires the `x86_64-pc-windows-gnu` Rust toolchain:
 

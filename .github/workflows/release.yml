@@ -1,0 +1,135 @@
+name: Release (CalVer)
+
+on:
+  push:
+    tags:
+      - "v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional CalVer tag (e.g. v2026.11.22). Leave empty for today's UTC date."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Expose MSYS2 binutils for windres
+        run: |
+          if (Test-Path "C:\msys64\mingw64\bin") {
+            "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Resolve CalVer tag
+        id: calver
+        run: |
+          $inputTag = "${{ inputs.tag }}".Trim()
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+          } elseif ($inputTag -ne "") {
+            $tag = if ($inputTag.StartsWith("v")) { $inputTag } else { "v$inputTag" }
+          } else {
+            git fetch --tags --quiet
+            $base = "v" + (Get-Date).ToUniversalTime().ToString("yyyy.MM.dd")
+            $existing = @(git tag -l "$base*")
+            if ($existing -notcontains $base) {
+              $tag = $base
+            } else {
+              $n = 1
+              while ($existing -contains "$base.$n") { $n++ }
+              $tag = "$base.$n"
+            }
+          }
+
+          if ($tag -notmatch '^v\d{4}\.\d{2}\.\d{2}(\.\d+)?$') {
+            throw "Tag '$tag' does not match CalVer format vYYYY.MM.DD[.N]"
+          }
+
+          $version = $tag.TrimStart('v')
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Resolved CalVer release: $tag ($version)"
+
+      - name: Lint and unit tests
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Build portable .exe and verify PE
+        env:
+          BATTERY_TRAY_VERSION: ${{ steps.calver.outputs.version }}
+        run: |
+          cargo build --release --locked
+          & "$PWD/tools/verify_portable.ps1" -Path "target\release\battery-tray.exe" -ExpectedVersion "$env:BATTERY_TRAY_VERSION"
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\release\battery-tray.exe" "dist\battery-tray.exe"
+          $hash = (Get-FileHash "dist\battery-tray.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  battery-tray.exe" | Out-File -FilePath "dist\battery-tray.exe.sha256" -Encoding ascii
+          $sizeKb = [Math]::Round((Get-Item "dist\battery-tray.exe").Length / 1024, 1)
+          "size_kb=$sizeKb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        id: build
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        continue-on-error: true
+        with:
+          subject-path: dist/battery-tray.exe
+
+      - name: Write release body
+        run: |
+          $body = @'
+          ### Portable Windows 11 Build (`__TAG__` — ~__SIZE_KB__ KB)
+
+          1. Download **`battery-tray.exe`** below.
+          2. Double-click to run directly (no installer, no archive, zero external dependencies).
+             *(If Windows SmartScreen prompts on first launch of an unsigned binary, click **More info → Run anyway**.)*
+
+          #### Optional: Install & Run at Windows Startup (PowerShell)
+          ```powershell
+          $dst = "$env:LOCALAPPDATA\Programs\battery-tray\battery-tray.exe"
+          New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+          Invoke-WebRequest "https://github.com/__REPO__/releases/download/__TAG__/battery-tray.exe" -OutFile $dst
+          Unblock-File $dst
+          Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray" -Value "`"$dst`""
+          Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
+          Start-Process $dst
+          ```
+
+          **SHA-256 (`battery-tray.exe`):** `__SHA256__`
+          '@
+          $body = $body.Replace("__TAG__", "${{ steps.calver.outputs.tag }}")
+          $body = $body.Replace("__SIZE_KB__", "${{ steps.build.outputs.size_kb }}")
+          $body = $body.Replace("__REPO__", "${{ github.repository }}")
+          $body = $body.Replace("__SHA256__", "${{ steps.build.outputs.sha256 }}")
+          $body | Out-File -FilePath "dist\release_body.md" -Encoding utf8
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.calver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Battery Tray ${{ steps.calver.outputs.tag }}
+          body_path: dist/release_body.md
+          generate_release_notes: true
+          files: |
+            dist/battery-tray.exe
+            dist/battery-tray.exe.sha256

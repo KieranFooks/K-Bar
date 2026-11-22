@@ -111,59 +111,62 @@ jobs:
             }
           }
 
-          $range = if ($prevTag -ne "") { "$prevTag..HEAD" } else { "HEAD" }
-          $rawCommits = @(git log $range --no-merges --format="%h`t%s")
-
-          $features = [System.Collections.Generic.List[string]]::new()
-          $fixes = [System.Collections.Generic.List[string]]::new()
-          $maintenance = [System.Collections.Generic.List[string]]::new()
-          $other = [System.Collections.Generic.List[string]]::new()
-
-          foreach ($line in $rawCommits) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            $parts = $line -split "`t", 2
-            $sha = $parts[0]
-            $msg = $parts[1]
-            $entry = "- $msg (``$sha``)"
-            if ($msg -match '^feat(\([^)]+\))?(!)?:\s*') {
-              $features.Add($entry)
-            } elseif ($msg -match '^fix(\([^)]+\))?(!)?:\s*') {
-              $fixes.Add($entry)
-            } elseif ($msg -match '^(docs|ci|build|chore)(\([^)]+\))?(!)?:\s*') {
-              $maintenance.Add($entry)
-            } else {
-              $other.Add($entry)
-            }
-          }
-
           $changelog = [System.Collections.Generic.List[string]]::new()
           $changelog.Add("## Changelog")
           $changelog.Add("")
-          if ($features.Count -gt 0) {
-            $changelog.Add("### Features")
-            $features | ForEach-Object { $changelog.Add($_) }
+
+          if ($prevTag -eq "") {
+            $changelog.Add("- Initial portable Windows 11 release (``$tag``): wireless battery taskbar indicator for Bluetooth PnP, Logitech, Razer, HyperX, SteelSeries, and Corsair peripherals.")
             $changelog.Add("")
-          }
-          if ($fixes.Count -gt 0) {
-            $changelog.Add("### Fixes")
-            $fixes | ForEach-Object { $changelog.Add($_) }
-            $changelog.Add("")
-          }
-          if ($other.Count -gt 0) {
-            $changelog.Add("### Changes")
-            $other | ForEach-Object { $changelog.Add($_) }
-            $changelog.Add("")
-          }
-          if ($maintenance.Count -gt 0) {
-            $changelog.Add("### Docs & CI")
-            $maintenance | ForEach-Object { $changelog.Add($_) }
-            $changelog.Add("")
-          }
-          if ($rawCommits.Count -eq 0) {
-            $changelog.Add("_No code changes since $prevTag._")
-            $changelog.Add("")
-          }
-          if ($prevTag -ne "") {
+          } else {
+            $rawCommits = @(git log "$prevTag..HEAD" --no-merges --format="%h`t%s")
+
+            $features = [System.Collections.Generic.List[string]]::new()
+            $fixes = [System.Collections.Generic.List[string]]::new()
+            $maintenance = [System.Collections.Generic.List[string]]::new()
+            $other = [System.Collections.Generic.List[string]]::new()
+
+            foreach ($line in $rawCommits) {
+              if ([string]::IsNullOrWhiteSpace($line)) { continue }
+              $parts = $line -split "`t", 2
+              $sha = $parts[0]
+              $msg = $parts[1]
+              $entry = "- $msg (``$sha``)"
+              if ($msg -match '^feat(\([^)]+\))?(!)?:\s*') {
+                $features.Add($entry)
+              } elseif ($msg -match '^fix(\([^)]+\))?(!)?:\s*') {
+                $fixes.Add($entry)
+              } elseif ($msg -match '^(docs|ci|build|chore)(\([^)]+\))?(!)?:\s*') {
+                $maintenance.Add($entry)
+              } else {
+                $other.Add($entry)
+              }
+            }
+
+            if ($features.Count -gt 0) {
+              $changelog.Add("### Features")
+              $features | ForEach-Object { $changelog.Add($_) }
+              $changelog.Add("")
+            }
+            if ($fixes.Count -gt 0) {
+              $changelog.Add("### Fixes")
+              $fixes | ForEach-Object { $changelog.Add($_) }
+              $changelog.Add("")
+            }
+            if ($other.Count -gt 0) {
+              $changelog.Add("### Changes")
+              $other | ForEach-Object { $changelog.Add($_) }
+              $changelog.Add("")
+            }
+            if ($maintenance.Count -gt 0) {
+              $changelog.Add("### Docs & CI")
+              $maintenance | ForEach-Object { $changelog.Add($_) }
+              $changelog.Add("")
+            }
+            if ($rawCommits.Count -eq 0) {
+              $changelog.Add("_No code changes since $prevTag._")
+              $changelog.Add("")
+            }
             $changelog.Add("**Full Changelog**: https://github.com/$repo/compare/$prevTag...$tag")
             $changelog.Add("")
           }

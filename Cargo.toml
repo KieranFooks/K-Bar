@@ -23,6 +23,11 @@ name = "glyphtest"
 path = "src/bin/glyphtest.rs"
 test = false
 
+[[bin]]
+name = "updatetest"
+path = "src/bin/updatetest.rs"
+test = false
+
 [dependencies]
 
 [profile.dev]

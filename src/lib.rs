@@ -5,6 +5,7 @@
 pub mod drivers;
 pub mod hid;
 pub mod icon;
+pub mod updater;
 pub mod widget;
 pub mod win32;
 
@@ -17,6 +18,8 @@ use win32::{RegGetValueW, ERROR_SUCCESS, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 pub const WM_POLL_NOW: u32 = 0x8000 + 2;
 pub const WM_SYNC_WIDGET: u32 = 0x8000 + 3;
 pub const WM_POLL_DONE: u32 = 0x8000 + 4;
+pub const WM_UPDATE_AVAILABLE: u32 = 0x8000 + 5;
+pub const WM_UPDATE_READY: u32 = 0x8000 + 6;
 
 /// `HKCU\...\Personalize\SystemUsesLightTheme` via `kernelbase.dll` (avoids `advapi32.dll`).
 pub fn light_theme() -> bool {

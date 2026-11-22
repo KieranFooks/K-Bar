@@ -52,6 +52,7 @@ fn main() {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let [v0, v1, v2, v3] = parse_win_version(&version_str);
     let safe_ver = sanitize_rc_string(version_str.trim().trim_start_matches('v'));
+    println!("cargo:rustc-env=KATT_BUILD_VERSION={safe_ver}");
 
     if let Some(windres) = find_windres() {
         let rc_path = out_dir.join("katt.rc");

@@ -315,8 +315,82 @@ pub const GENERIC_READ: u32 = 0x8000_0000;
 pub const GENERIC_WRITE: u32 = 0x4000_0000;
 pub const FILE_SHARE_READ: u32 = 1;
 pub const FILE_SHARE_WRITE: u32 = 2;
+pub const CREATE_ALWAYS: u32 = 2;
 pub const OPEN_EXISTING: u32 = 3;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+
+pub const MB_YESNO: u32 = 0x0000_0004;
+pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
+pub const IDYES: i32 = 6;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct STARTUPINFOW {
+    pub cb: u32,
+    pub lp_reserved: *mut u16,
+    pub lp_desktop: *mut u16,
+    pub lp_title: *mut u16,
+    pub dw_x: u32,
+    pub dw_y: u32,
+    pub dw_x_size: u32,
+    pub dw_y_size: u32,
+    pub dw_x_count_chars: u32,
+    pub dw_y_count_chars: u32,
+    pub dw_fill_attribute: u32,
+    pub dw_flags: u32,
+    pub w_show_window: u16,
+    pub cb_reserved2: u16,
+    pub lp_reserved2: *mut u8,
+    pub h_std_input: HANDLE,
+    pub h_std_output: HANDLE,
+    pub h_std_error: HANDLE,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PROCESS_INFORMATION {
+    pub h_process: HANDLE,
+    pub h_thread: HANDLE,
+    pub dw_process_id: u32,
+    pub dw_thread_id: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<STARTUPINFOW>() == 104);
+const _: () = assert!(core::mem::size_of::<PROCESS_INFORMATION>() == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ACTCTXW {
+    pub cb_size: u32,
+    pub dw_flags: u32,
+    pub lp_source: *const u16,
+    pub w_processor_architecture: u16,
+    pub w_lang_id: u16,
+    pub lp_assembly_directory: *const u16,
+    pub lp_resource_name: *const u16,
+    pub lp_application_name: *const u16,
+    pub h_module: HINSTANCE,
+}
+
+impl Default for ACTCTXW {
+    fn default() -> Self {
+        Self {
+            cb_size: core::mem::size_of::<Self>() as u32,
+            dw_flags: 0,
+            lp_source: core::ptr::null(),
+            w_processor_architecture: 0,
+            w_lang_id: 0,
+            lp_assembly_directory: core::ptr::null(),
+            lp_resource_name: core::ptr::null(),
+            lp_application_name: core::ptr::null(),
+            h_module: core::ptr::null_mut(),
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ACTCTXW>() == 56);
 
 pub const IOCTL_HID_SET_FEATURE: u32 = 0x000B_0191;
 pub const IOCTL_HID_GET_FEATURE: u32 = 0x000B_0192;
@@ -335,6 +409,7 @@ pub const DEVPROP_TYPE_STRING: u32 = 18;
 pub const DEVPROP_TYPE_STRING_LIST: u32 = 0x2012;
 
 pub const HKEY_CURRENT_USER: isize = (-2147483647i32) as isize;
+pub const RRF_RT_REG_SZ: u32 = 0x0000_0002;
 pub const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
 
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
@@ -482,6 +557,34 @@ extern "system" {
         flags: u32,
         tid: *mut u32,
     ) -> HANDLE;
+    pub fn LoadLibraryW(lib_file_name: *const u16) -> HINSTANCE;
+    pub fn FreeLibrary(lib_module: HINSTANCE) -> BOOL;
+    pub fn GetProcAddress(module: HINSTANCE, proc_name: *const u8) -> *const c_void;
+    pub fn GetModuleFileNameW(module: HINSTANCE, filename: *mut u16, size: u32) -> u32;
+    pub fn GetCommandLineW() -> *const u16;
+    pub fn MoveFileExW(
+        existing_file_name: *const u16,
+        new_file_name: *const u16,
+        flags: u32,
+    ) -> BOOL;
+    pub fn DeleteFileW(file_name: *const u16) -> BOOL;
+    pub fn CreateProcessW(
+        application_name: *const u16,
+        command_line: *mut u16,
+        process_attributes: *const c_void,
+        thread_attributes: *const c_void,
+        inherit_handles: BOOL,
+        creation_flags: u32,
+        environment: *const c_void,
+        current_directory: *const u16,
+        startup_info: *const STARTUPINFOW,
+        process_information: *mut PROCESS_INFORMATION,
+    ) -> BOOL;
+    pub fn GetTempPathW(buf_len: u32, buf: *mut u16) -> u32;
+    pub fn CreateActCtxW(act_ctx: *const ACTCTXW) -> HANDLE;
+    pub fn ActivateActCtx(act_ctx: HANDLE, cookie: *mut usize) -> BOOL;
+    pub fn DeactivateActCtx(flags: u32, cookie: usize) -> BOOL;
+    pub fn ReleaseActCtx(act_ctx: HANDLE);
 }
 
 #[link(name = "cfgmgr32", kind = "raw-dylib")]
@@ -635,6 +738,12 @@ extern "system" {
         cch_text: i32,
         lprc: *mut RECT,
         format: u32,
+    ) -> i32;
+    pub fn MessageBoxW(
+        hwnd: HWND,
+        text: *const u16,
+        caption: *const u16,
+        utype: u32,
     ) -> i32;
 }
 

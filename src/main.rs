@@ -16,33 +16,43 @@ use core::ptr::{addr_of_mut, null, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use katt::hid::{BatteryList, HidScanner, PollOutput};
+use katt::updater::{self, PromptAction, TagCheck};
 use katt::widget::WidgetWindow;
 use katt::win32::{
     CloseHandle, CreateEventW, CreateMutexW, CreateThread, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, ExitProcess, GetDesktopWindow, GetLastError, GetMessageW,
-    GetModuleHandleW, GetWindowThreadProcessId, ImmDisableIME, KillTimer, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetEvent,
-    SetProcessDpiAwarenessContext, SetTimer, SetWinEventHook, SingleThreadCell, UnhookWinEvent,
-    WaitForSingleObject, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, ERROR_ALREADY_EXISTS,
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, HANDLE,
-    HWND, HWINEVENTHOOK, INFINITE, MSG, OBJID_CLIENT, OBJID_WINDOW, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_DESTROY,
-    WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    DestroyWindow, DispatchMessageW, ExitProcess, GetCommandLineW, GetDesktopWindow, GetLastError,
+    GetMessageW, GetModuleHandleW, GetWindowThreadProcessId, ImmDisableIME, IsWindowVisible,
+    KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetEvent,
+    SetProcessDpiAwarenessContext, SetTimer, SetWinEventHook, SingleThreadCell, Sleep,
+    UnhookWinEvent, WaitForSingleObject, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    ERROR_ALREADY_EXISTS, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, HANDLE, HWND, HWINEVENTHOOK, INFINITE, MSG, OBJID_CLIENT,
+    OBJID_WINDOW, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
 };
 use katt::{
     light_theme, merge_devices, w, widget, WM_POLL_DONE, WM_POLL_NOW, WM_SYNC_WIDGET,
+    WM_UPDATE_AVAILABLE, WM_UPDATE_READY,
 };
 
 const POLL_TIMER_ID: usize = 100;
 const DEVICECHANGE_DEBOUNCE_TIMER_ID: usize = 101;
 const WIDGET_SYNC_TIMER_ID: usize = 102;
+const UPDATE_INITIAL_TIMER_ID: usize = 103;
+const UPDATE_DAILY_TIMER_ID: usize = 104;
 const POLL_INTERVAL_MS: u32 = 45_000;
 const WIDGET_SYNC_INTERVAL_MS: u32 = 1_000;
+const UPDATE_INITIAL_DELAY_MS: u32 = 30_000;
+const UPDATE_DAILY_INTERVAL_MS: u32 = 86_400_000;
+const GITHUB_LATEST_URL: &str = "https://github.com/KieranFooks/katt/releases/latest";
+const BUILD_VERSION: &str = env!("KATT_BUILD_VERSION");
 
 static TASKBAR_CREATED: AtomicUsize = AtomicUsize::new(0);
 static MAIN_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
+static INSTANCE_MUTEX_RAW: AtomicUsize = AtomicUsize::new(0);
 static DESKTOP_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 static TRAY_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
 static NOTIFY_HWND_RAW: AtomicUsize = AtomicUsize::new(0);
@@ -54,6 +64,13 @@ static POLL_FORCE_RESCAN: AtomicBool = AtomicBool::new(false);
 static POLL_STOP: AtomicBool = AtomicBool::new(false);
 static POLL_HAS_DATA: AtomicBool = AtomicBool::new(false);
 static SLOT_LOCK: AtomicBool = AtomicBool::new(false);
+
+static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
+static UPDATE_PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static UPDATE_DEFERRED_PROMPT: AtomicBool = AtomicBool::new(false);
+static UPDATE_TAG_LOCK: AtomicBool = AtomicBool::new(false);
+static PENDING_UPDATE: SingleThreadCell<MaybeUninit<TagCheck>> =
+    SingleThreadCell::new(MaybeUninit::zeroed());
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -299,6 +316,8 @@ unsafe fn cleanup_app_state(hwnd: HWND) {
     let _ = KillTimer(hwnd, POLL_TIMER_ID);
     let _ = KillTimer(hwnd, DEVICECHANGE_DEBOUNCE_TIMER_ID);
     let _ = KillTimer(hwnd, WIDGET_SYNC_TIMER_ID);
+    let _ = KillTimer(hwnd, UPDATE_INITIAL_TIMER_ID);
+    let _ = KillTimer(hwnd, UPDATE_DAILY_TIMER_ID);
 
     MAIN_HWND_RAW.store(0, Ordering::Release);
     DESKTOP_HWND_RAW.store(0, Ordering::Relaxed);
@@ -382,6 +401,202 @@ unsafe extern "system" fn win_event_proc(
     }
 }
 
+#[inline]
+fn lock_update_tag() {
+    while UPDATE_TAG_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn unlock_update_tag() {
+    UPDATE_TAG_LOCK.store(false, Ordering::Release);
+}
+
+unsafe extern "system" fn update_check_proc(_param: *mut c_void) -> u32 {
+    if let Some(local_ver) = updater::parse_calver(BUILD_VERSION) {
+        if !updater::is_dev_version(local_ver) {
+            if let Ok(check) = updater::check_latest_tag(GITHUB_LATEST_URL) {
+                let tag = check.tag_str();
+                if updater::is_newer(check.version, local_ver) && !updater::is_version_skipped(tag)
+                {
+                    lock_update_tag();
+                    (*PENDING_UPDATE.get()).write(check);
+                    unlock_update_tag();
+                    let main_raw = MAIN_HWND_RAW.load(Ordering::Acquire);
+                    if main_raw != 0 {
+                        let _ = PostMessageW(main_raw as HWND, WM_UPDATE_AVAILABLE, 0, 0);
+                    }
+                }
+            }
+        }
+    }
+    UPDATE_BUSY.store(false, Ordering::Release);
+    0
+}
+
+unsafe extern "system" fn update_download_proc(_param: *mut c_void) -> u32 {
+    lock_update_tag();
+    let check = (*PENDING_UPDATE.get()).assume_init_read();
+    unlock_update_tag();
+
+    let tag = check.tag_str();
+    let mut sha_url_buf = [0u8; 256];
+    let mut exe_url_buf = [0u8; 256];
+    let mut exe_path = [0u16; 260];
+    let mut new_path = [0u16; 270];
+
+    let ok = updater::current_exe_utf16(&mut exe_path)
+        && updater::make_new_path_utf16(&exe_path, &mut new_path)
+        && if let (Some(sha_url), Some(exe_url)) = (
+            updater::format_github_asset_url(tag, "katt.exe.sha256", &mut sha_url_buf),
+            updater::format_github_asset_url(tag, "katt.exe", &mut exe_url_buf),
+        ) {
+            match updater::fetch_sha256(sha_url) {
+                Ok(expected_sha) => {
+                    updater::download_and_verify_pe(exe_url, &new_path, &expected_sha).is_ok()
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+    if ok {
+        let main_raw = MAIN_HWND_RAW.load(Ordering::Acquire);
+        if main_raw != 0 {
+            let _ = PostMessageW(main_raw as HWND, WM_UPDATE_READY, 0, 0);
+        }
+    } else {
+        UPDATE_BUSY.store(false, Ordering::Release);
+    }
+    0
+}
+
+unsafe fn spawn_update_check() {
+    if UPDATE_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let h = CreateThread(null(), 64 * 1024, update_check_proc, null_mut(), 0, null_mut());
+    if h.is_null() {
+        UPDATE_BUSY.store(false, Ordering::Release);
+    } else {
+        let _ = CloseHandle(h);
+    }
+}
+
+unsafe fn can_prompt_update_now() -> bool {
+    let Some(state) = app_mut() else {
+        return false;
+    };
+    state.active
+        && state
+            .widget
+            .as_ref()
+            .is_some_and(|w| IsWindowVisible(w.hwnd) != 0)
+}
+
+#[inline(never)]
+unsafe fn maybe_show_update_prompt(hwnd: HWND) {
+    if !UPDATE_DEFERRED_PROMPT.load(Ordering::Acquire)
+        || UPDATE_PROMPT_ACTIVE.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    if !can_prompt_update_now() {
+        UPDATE_PROMPT_ACTIVE.store(false, Ordering::Release);
+        return;
+    }
+    UPDATE_DEFERRED_PROMPT.store(false, Ordering::Release);
+
+    lock_update_tag();
+    let check = (*PENDING_UPDATE.get()).assume_init_read();
+    unlock_update_tag();
+
+    let outcome = updater::show_update_dialog(
+        hwnd as usize,
+        BUILD_VERSION,
+        check.tag_str(),
+        check.release_url_str(),
+    );
+    UPDATE_PROMPT_ACTIVE.store(false, Ordering::Release);
+
+    if outcome.skip_version {
+        updater::save_skipped_version(check.tag_str());
+    }
+    if outcome.action == PromptAction::UpdateNow {
+        lock_update_tag();
+        (*PENDING_UPDATE.get()).write(check);
+        unlock_update_tag();
+        if !UPDATE_BUSY.swap(true, Ordering::AcqRel) {
+            let h = CreateThread(null(), 64 * 1024, update_download_proc, null_mut(), 0, null_mut());
+            if h.is_null() {
+                UPDATE_BUSY.store(false, Ordering::Release);
+            } else {
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
+#[inline(never)]
+unsafe fn apply_ready_update(hwnd: HWND) {
+    let mut exe_path = [0u16; 260];
+    let mut new_path = [0u16; 270];
+    if !updater::current_exe_utf16(&mut exe_path)
+        || !updater::make_new_path_utf16(&exe_path, &mut new_path)
+    {
+        UPDATE_BUSY.store(false, Ordering::Release);
+        return;
+    }
+
+    cleanup_app_state(hwnd);
+    let _ = DestroyWindow(hwnd);
+    let mut_raw = INSTANCE_MUTEX_RAW.swap(0, Ordering::AcqRel);
+    if mut_raw != 0 {
+        let _ = CloseHandle(mut_raw as HANDLE);
+    }
+
+    match updater::apply_update_and_spawn(&exe_path, &new_path, "--updated") {
+        Ok(child_proc) => {
+            if !child_proc.is_null() {
+                let _ = CloseHandle(child_proc);
+            }
+            ExitProcess(0);
+        }
+        Err(_) => {
+            ExitProcess(1);
+        }
+    }
+}
+
+unsafe fn cmdline_has_updated_flag() -> bool {
+    let ptr = GetCommandLineW();
+    if ptr.is_null() {
+        return false;
+    }
+    let needle = [
+        b'-' as u16,
+        b'-' as u16,
+        b'u' as u16,
+        b'p' as u16,
+        b'd' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b'e' as u16,
+        b'd' as u16,
+    ];
+    let mut len = 0usize;
+    while len < 512 && *ptr.add(len) != 0 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(ptr, len);
+    slice.windows(needle.len()).any(|w| w == needle)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
         WM_POLL_NOW => {
@@ -395,6 +610,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         WM_SYNC_WIDGET => {
             SYNC_PENDING.store(false, Ordering::Release);
             sync_widget(false);
+            maybe_show_update_prompt(hwnd);
+            0
+        }
+        WM_UPDATE_AVAILABLE => {
+            UPDATE_DEFERRED_PROMPT.store(true, Ordering::Release);
+            maybe_show_update_prompt(hwnd);
+            0
+        }
+        WM_UPDATE_READY => {
+            apply_ready_update(hwnd);
             0
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
@@ -433,6 +658,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_TIMER if wp == WIDGET_SYNC_TIMER_ID => {
             sync_widget(false);
+            maybe_show_update_prompt(hwnd);
+            0
+        }
+        WM_TIMER if wp == UPDATE_INITIAL_TIMER_ID => {
+            let _ = KillTimer(hwnd, UPDATE_INITIAL_TIMER_ID);
+            spawn_update_check();
+            0
+        }
+        WM_TIMER if wp == UPDATE_DAILY_TIMER_ID => {
+            spawn_update_check();
             0
         }
         WM_POWERBROADCAST => {
@@ -469,13 +704,43 @@ pub extern "system" fn mainCRTStartup() -> ! {
         let _ = ImmDisableIME(0xFFFF_FFFF);
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-        let instance_mutex = CreateMutexW(null(), 0, w!("Local\\katt.SingleInstance"));
+        let is_relaunched_update = cmdline_has_updated_flag();
+        let mut instance_mutex = CreateMutexW(null(), 0, w!("Local\\katt.SingleInstance"));
         if instance_mutex.is_null() {
             ExitProcess(1);
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let _ = CloseHandle(instance_mutex);
-            ExitProcess(0);
+            let mut acquired = false;
+            if is_relaunched_update {
+                let mut tries = 0;
+                while tries < 15 {
+                    let _ = CloseHandle(instance_mutex);
+                    Sleep(100);
+                    instance_mutex = CreateMutexW(null(), 0, w!("Local\\katt.SingleInstance"));
+                    if instance_mutex.is_null() {
+                        ExitProcess(1);
+                    }
+                    if GetLastError() != ERROR_ALREADY_EXISTS {
+                        acquired = true;
+                        break;
+                    }
+                    tries += 1;
+                }
+            }
+            if !acquired {
+                let _ = CloseHandle(instance_mutex);
+                ExitProcess(0);
+            }
+        }
+        INSTANCE_MUTEX_RAW.store(instance_mutex as usize, Ordering::Release);
+
+        let mut exe_buf = [0u16; 260];
+        if updater::current_exe_utf16(&mut exe_buf) {
+            if is_relaunched_update {
+                let _ = updater::cleanup_old_binary(&exe_buf);
+            } else {
+                updater::try_delete_old_once(&exe_buf);
+            }
         }
 
         let hinst = GetModuleHandleW(null());
@@ -564,6 +829,17 @@ pub extern "system" fn mainCRTStartup() -> ! {
 
         let _ = SetTimer(hwnd, POLL_TIMER_ID, POLL_INTERVAL_MS, null());
         let _ = SetTimer(hwnd, WIDGET_SYNC_TIMER_ID, WIDGET_SYNC_INTERVAL_MS, null());
+        if let Some(local_ver) = updater::parse_calver(BUILD_VERSION) {
+            if !updater::is_dev_version(local_ver) {
+                let _ = SetTimer(
+                    hwnd,
+                    UPDATE_INITIAL_TIMER_ID,
+                    UPDATE_INITIAL_DELAY_MS,
+                    null(),
+                );
+                let _ = SetTimer(hwnd, UPDATE_DAILY_TIMER_ID, UPDATE_DAILY_INTERVAL_MS, null());
+            }
+        }
         let _ = PostMessageW(hwnd, WM_POLL_NOW, 0, 0);
 
         let mut msg = MSG::default();
@@ -577,7 +853,10 @@ pub extern "system" fn mainCRTStartup() -> ! {
             }
         }
         cleanup_app_state(hwnd);
-        let _ = CloseHandle(instance_mutex);
+        let mut_raw = INSTANCE_MUTEX_RAW.swap(0, Ordering::AcqRel);
+        if mut_raw != 0 {
+            let _ = CloseHandle(mut_raw as HANDLE);
+        }
         ExitProcess(0)
     }
 }

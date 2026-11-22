@@ -2,7 +2,7 @@
 
 use core::ptr::{null, null_mut};
 
-use katt::drivers::{corsair, hyperx, logitech, razer, steelseries};
+use katt::drivers::{corsair, hyperx, logitech, pulsar, razer, steelseries};
 use katt::hid::{
     self, hidpp_request, parse_1000_status, parse_1001_voltage, parse_1004_status,
 };
@@ -29,6 +29,8 @@ fn driver_family(vid: u16, pid: u16, up: u16, u: u16) -> &'static str {
         "SteelSeries"
     } else if corsair::is_candidate(vid, pid, up, u) {
         "Corsair"
+    } else if pulsar::is_candidate(vid, pid, up, u) {
+        "Pulsar"
     } else {
         "Unknown"
     }

@@ -7,7 +7,7 @@ use crate::drivers::{
     bluetooth, corsair, hyperx,
     io::{open_hid, open_hid_feature, vp_u32, RawCandidate},
     logitech::{self, LogitechEndpoint, LOGI_EP_CAP},
-    razer, steelseries,
+    pulsar, razer, steelseries,
 };
 use crate::win32::{
     CloseHandle, CreateEventW, GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST,
@@ -228,6 +228,7 @@ enum GenericProto {
     Razer(Kind, u8),
     Steel(steelseries::SteelProto),
     Corsair(corsair::CorsairProto),
+    Pulsar,
 }
 
 #[derive(Clone, Copy)]
@@ -386,7 +387,8 @@ impl HidScanner {
                 || hyperx::is_candidate(vid, pid, up)
                 || razer::is_candidate(vid, pid, up, u)
                 || steelseries::is_candidate(vid, pid, up, u)
-                || corsair::is_candidate(vid, pid, up, u);
+                || corsair::is_candidate(vid, pid, up, u)
+                || pulsar::is_candidate(vid, pid, up, u);
             if !matched {
                 continue;
             }
@@ -455,6 +457,7 @@ impl HidScanner {
             GenericProto::Razer(k, tx) => razer::poll_handle(h, ev, pid, k, tx),
             GenericProto::Steel(sp) => steelseries::poll_handle(h, ev, pid, sp),
             GenericProto::Corsair(cp) => corsair::poll_handle(h, ev, pid, cp),
+            GenericProto::Pulsar => pulsar::poll_handle(h, ev, vid, pid),
             GenericProto::None => None,
         };
         let _ = CloseHandle(h);
@@ -538,6 +541,8 @@ impl HidScanner {
                 GenericProto::Steel(sp)
             } else if let Some(cp) = corsair::match_proto(c.vid, c.pid, c.usage_page, c.usage) {
                 GenericProto::Corsair(cp)
+            } else if pulsar::is_candidate(c.vid, c.pid, c.usage_page, c.usage) {
+                GenericProto::Pulsar
             } else {
                 continue;
             };

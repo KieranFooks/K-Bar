@@ -604,7 +604,7 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
         let wc = WNDCLASSW {
             lpfn_wnd_proc: Some(widget_proc),
             h_instance: hinst,
-            lpsz_class_name: w!("BatteryTrayWidgetClass"),
+            lpsz_class_name: w!("KattWidgetClass"),
             ..Default::default()
         };
         let _ = RegisterClassW(&wc);
@@ -614,8 +614,8 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
     if let Some(owner) = owner_tray {
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("BatteryTrayWidgetClass"),
-            w!("Battery Tray"),
+            w!("KattWidgetClass"),
+            w!("katt"),
             WS_POPUP,
             0,
             0,
@@ -636,8 +636,8 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
 
     let hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-        w!("BatteryTrayWidgetClass"),
-        w!("Battery Tray"),
+        w!("KattWidgetClass"),
+        w!("katt"),
         WS_POPUP,
         0,
         0,

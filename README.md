@@ -1,6 +1,6 @@
-# Battery Tray
+# katt
 
-Minimalist `#![no_std]` + `#![no_main]` native Windows 11 utility (zero external crates, linked with `-nostdlib`) that displays wireless peripheral battery levels (**mice, keyboards, headsets, and Bluetooth gamepads**) across **Bluetooth PnP**, **Logitech**, **Razer**, **HyperX**, **SteelSeries**, and **Corsair** in a monochrome 2-row × N-column block integrated directly on the taskbar next to the system tray.
+**Kiéran's Battery Tray** (*katt*) is a lightweight Windows 11 taskbar utility that displays live battery levels for your wireless mice, keyboards, headsets, and gamepads right next to the system tray.
 
 ![Windows 11 taskbar preview](docs/preview.png)
 
@@ -18,37 +18,39 @@ Minimalist `#![no_std]` + `#![no_main]` native Windows 11 utility (zero external
 
 | Metric | Current (`#![no_std]` `-nostdlib`) |
 | --- | --- |
-| Binary size | **~39 KB** (`0 B` `.data`) |
+| Binary size | **40 KB** (`0 B` `.data`) |
+| RAM usage | **~0.3–0.7 MB** private working set (~1.2–1.35 MB private bytes) |
+| CPU usage | **~0.00%** (~0.002% average over 3 h incl. 45 s polls) |
 | Cargo dependencies | **0 external crates** |
 | Threads | **2** (UI + background HID/BT poller) |
 | UI guard timer | **1,000 ms** (event-driven hooks) |
 
 ## Download & Run (Portable `.exe`)
 
-Download the latest single-file portable executable (~40 KB, zero dependencies, no installer) from [GitHub Releases](https://github.com/KieranFooks/K-Bar/releases/latest):
+Download the latest single-file portable executable (40 KB, zero dependencies, no installer) from [GitHub Releases](https://github.com/KieranFooks/katt/releases/latest):
 
-- **Direct download**: [`battery-tray.exe`](https://github.com/KieranFooks/K-Bar/releases/latest/download/battery-tray.exe) (CalVer releases `vYYYY.MM.DD`)
+- **Direct download**: [`katt.exe`](https://github.com/KieranFooks/katt/releases/latest/download/katt.exe) (CalVer releases `vYYYY.MM.DD`)
 
-Double-click `battery-tray.exe` to run it immediately. *(On first launch of an unsigned binary, Windows SmartScreen may ask for confirmation: **More info → Run anyway**.)*
+Double-click `katt.exe` to run it immediately. *(On first launch of an unsigned binary, Windows SmartScreen may ask for confirmation: **More info → Run anyway**.)*
 
 ### Optional: One-Line Install & Windows Startup (PowerShell)
 
 ```powershell
-$dst = "$env:LOCALAPPDATA\Programs\battery-tray\battery-tray.exe"
+$dst = "$env:LOCALAPPDATA\Programs\katt\katt.exe"
 New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-Invoke-WebRequest "https://github.com/KieranFooks/K-Bar/releases/latest/download/battery-tray.exe" -OutFile $dst
+Invoke-WebRequest "https://github.com/KieranFooks/katt/releases/latest/download/katt.exe" -OutFile $dst
 Unblock-File $dst
-Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray" -Value "`"$dst`""
-Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
+Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -Value "`"$dst`""
+Stop-Process -Name katt -ErrorAction SilentlyContinue
 Start-Process $dst
 ```
 
 Uninstall cleanly:
 
 ```powershell
-Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
-Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray" -ErrorAction SilentlyContinue
-Remove-Item "$env:LOCALAPPDATA\Programs\battery-tray" -Recurse -Force -ErrorAction SilentlyContinue
+Stop-Process -Name katt -ErrorAction SilentlyContinue
+Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\Programs\katt" -Recurse -Force -ErrorAction SilentlyContinue
 ```
 
 ## Build from Source
@@ -56,7 +58,7 @@ Remove-Item "$env:LOCALAPPDATA\Programs\battery-tray" -Recurse -Force -ErrorActi
 Requires the `x86_64-pc-windows-gnu` Rust toolchain:
 
 ```powershell
-# Build release binary (target\release\battery-tray.exe)
+# Build release binary (target\release\katt.exe)
 cargo build --release
 
 # Run unit tests
@@ -69,8 +71,8 @@ cargo run --bin poc
 Launch or restart manually:
 
 ```powershell
-Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
-Start-Process ".\target\release\battery-tray.exe"
+Stop-Process -Name katt -ErrorAction SilentlyContinue
+Start-Process ".\target\release\katt.exe"
 ```
 
 ## Run at Windows Startup
@@ -79,8 +81,8 @@ From the repository root in PowerShell:
 
 ```powershell
 # Enable
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray" -Value "`"$PWD\target\release\battery-tray.exe`""
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -Value "`"$PWD\target\release\katt.exe`""
 
 # Disable
-Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray"
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt"
 ```

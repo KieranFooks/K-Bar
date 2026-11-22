@@ -39,14 +39,14 @@ fn sanitize_rc_string(s: &str) -> String {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=BATTERY_TRAY_VERSION");
-    println!("cargo:rustc-link-arg-bin=battery-tray=-nostdlib");
+    println!("cargo:rerun-if-env-changed=KATT_VERSION");
+    println!("cargo:rustc-link-arg-bin=katt=-nostdlib");
     println!(
-        "cargo:rustc-link-arg-bin=battery-tray=-Wl,--subsystem,windows,-e,mainCRTStartup,--gc-sections"
+        "cargo:rustc-link-arg-bin=katt=-Wl,--subsystem,windows,-e,mainCRTStartup,--gc-sections"
     );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
-    let version_str = env::var("BATTERY_TRAY_VERSION")
+    let version_str = env::var("KATT_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
@@ -54,8 +54,8 @@ fn main() {
     let safe_ver = sanitize_rc_string(version_str.trim().trim_start_matches('v'));
 
     if let Some(windres) = find_windres() {
-        let rc_path = out_dir.join("battery_tray.rc");
-        let res_obj_path = out_dir.join("battery_tray_res.o");
+        let rc_path = out_dir.join("katt.rc");
+        let res_obj_path = out_dir.join("katt_res.o");
         let rc_content = format!(
             r#"1 VERSIONINFO
 FILEVERSION {v0},{v1},{v2},{v3}
@@ -70,12 +70,12 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "K-Bar"
-            VALUE "FileDescription", "Battery Tray - Wireless peripheral battery indicator"
+            VALUE "CompanyName", "KieranFooks"
+            VALUE "FileDescription", "katt - Wireless peripheral battery indicator"
             VALUE "FileVersion", "{safe_ver}"
-            VALUE "InternalName", "battery-tray"
-            VALUE "OriginalFilename", "battery-tray.exe"
-            VALUE "ProductName", "Battery Tray"
+            VALUE "InternalName", "katt"
+            VALUE "OriginalFilename", "katt.exe"
+            VALUE "ProductName", "katt"
             VALUE "ProductVersion", "{safe_ver}"
         END
     END
@@ -97,7 +97,7 @@ END
             .expect("failed to invoke windres");
 
         if status.success() {
-            println!("cargo:rustc-link-arg-bin=battery-tray={}", res_obj_path.display());
+            println!("cargo:rustc-link-arg-bin=katt={}", res_obj_path.display());
         } else {
             println!("cargo:warning=windres failed with status {status}; skipping VERSIONINFO");
         }

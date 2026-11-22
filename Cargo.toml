@@ -1,15 +1,15 @@
 [package]
-name = "battery-tray"
+name = "katt"
 version = "0.1.0"
 edition = "2021"
-description = "Ultra-lightweight #![no_std] Win32 tray utility showing wireless peripheral battery levels"
+description = "Ultra-lightweight #![no_std] Win32 taskbar utility showing wireless peripheral battery levels"
 
 [lib]
-name = "battery_tray"
+name = "katt"
 path = "src/lib.rs"
 
 [[bin]]
-name = "battery-tray"
+name = "katt"
 path = "src/main.rs"
 test = false
 

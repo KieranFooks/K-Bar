@@ -2,7 +2,7 @@
 //! Windows 11 taskbar backgrounds at 96 DPI and 144 DPI (1x and 2x zoom).
 //! Usage: glyphtest.exe [output.bmp]
 
-use battery_tray::{
+use katt::{
     hid::{Battery, BatteryList, Kind, Source},
     widget,
 };

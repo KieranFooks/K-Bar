@@ -33,6 +33,6 @@ jobs:
       - name: Build portable release binary and verify PE
         run: |
           $ver = (Get-Date).ToUniversalTime().ToString("yyyy.MM.dd")
-          $env:BATTERY_TRAY_VERSION = $ver
+          $env:KATT_VERSION = $ver
           cargo build --release --locked
-          & "$PWD/tools/verify_portable.ps1" -Path "target\release\battery-tray.exe" -ExpectedVersion $ver
+          & "$PWD/tools/verify_portable.ps1" -Path "target\release\katt.exe" -ExpectedVersion $ver

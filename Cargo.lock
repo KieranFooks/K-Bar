@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "battery-tray"
+name = "katt"
 version = "0.1.0"

@@ -75,16 +75,16 @@ jobs:
       - name: Build portable .exe and verify PE
         id: build
         env:
-          BATTERY_TRAY_VERSION: ${{ steps.calver.outputs.version }}
+          KATT_VERSION: ${{ steps.calver.outputs.version }}
         run: |
           cargo build --release --locked
-          & "$PWD/tools/verify_portable.ps1" -Path "target\release\battery-tray.exe" -ExpectedVersion "$env:BATTERY_TRAY_VERSION"
+          & "$PWD/tools/verify_portable.ps1" -Path "target\release\katt.exe" -ExpectedVersion "$env:KATT_VERSION"
 
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target\release\battery-tray.exe" "dist\battery-tray.exe"
-          $hash = (Get-FileHash "dist\battery-tray.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  battery-tray.exe" | Out-File -FilePath "dist\battery-tray.exe.sha256" -Encoding ascii
-          $sizeKb = [Math]::Round((Get-Item "dist\battery-tray.exe").Length / 1024, 1)
+          Copy-Item "target\release\katt.exe" "dist\katt.exe"
+          $hash = (Get-FileHash "dist\katt.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  katt.exe" | Out-File -FilePath "dist\katt.exe.sha256" -Encoding ascii
+          $sizeKb = [Math]::Round((Get-Item "dist\katt.exe").Length / 1024, 1)
           "size_kb=$sizeKb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -92,7 +92,7 @@ jobs:
         uses: actions/attest-build-provenance@v2
         continue-on-error: true
         with:
-          subject-path: dist/battery-tray.exe
+          subject-path: dist/katt.exe
 
       - name: Generate changelog and release notes
         run: |
@@ -172,24 +172,24 @@ jobs:
           }
 
           $header = @'
-          ### Portable Windows 11 Build (`__TAG__` — ~__SIZE_KB__ KB)
+          ### Portable Windows 11 Build (`__TAG__`, ~__SIZE_KB__ KB)
 
-          1. Download **`battery-tray.exe`** below.
+          1. Download **`katt.exe`** below.
           2. Double-click to run directly (no installer, no archive, zero external dependencies).
              *(If Windows SmartScreen prompts on first launch of an unsigned binary, click **More info → Run anyway**.)*
 
           #### Optional: Install & Run at Windows Startup (PowerShell)
           ```powershell
-          $dst = "$env:LOCALAPPDATA\Programs\battery-tray\battery-tray.exe"
+          $dst = "$env:LOCALAPPDATA\Programs\katt\katt.exe"
           New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-          Invoke-WebRequest "https://github.com/__REPO__/releases/download/__TAG__/battery-tray.exe" -OutFile $dst
+          Invoke-WebRequest "https://github.com/__REPO__/releases/download/__TAG__/katt.exe" -OutFile $dst
           Unblock-File $dst
-          Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BatteryTray" -Value "`"$dst`""
-          Stop-Process -Name battery-tray -ErrorAction SilentlyContinue
+          Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "katt" -Value "`"$dst`""
+          Stop-Process -Name katt -ErrorAction SilentlyContinue
           Start-Process $dst
           ```
 
-          **SHA-256 (`battery-tray.exe`):** `__SHA256__`
+          **SHA-256 (`katt.exe`):** `__SHA256__`
 
           ---
 
@@ -203,8 +203,8 @@ jobs:
         with:
           tag_name: ${{ steps.calver.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Battery Tray ${{ steps.calver.outputs.tag }}
+          name: katt ${{ steps.calver.outputs.tag }}
           body_path: dist/release_body.md
           files: |
-            dist/battery-tray.exe
-            dist/battery-tray.exe.sha256
+            dist/katt.exe
+            dist/katt.exe.sha256

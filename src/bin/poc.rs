@@ -1,12 +1,12 @@
-//! Live hardware diagnostic probe for battery-tray (no `setupapi.dll`, no `hid.dll`, no `windows` crate).
+//! Live hardware diagnostic probe for katt (no `setupapi.dll`, no `hid.dll`, no `windows` crate).
 
 use core::ptr::{null, null_mut};
 
-use battery_tray::drivers::{corsair, hyperx, logitech, razer, steelseries};
-use battery_tray::hid::{
+use katt::drivers::{corsair, hyperx, logitech, razer, steelseries};
+use katt::hid::{
     self, hidpp_request, parse_1000_status, parse_1001_voltage, parse_1004_status,
 };
-use battery_tray::win32::{
+use katt::win32::{
     CloseHandle, CreateEventW, CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
     FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, OPEN_EXISTING,
 };

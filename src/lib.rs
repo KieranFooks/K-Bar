@@ -1,4 +1,4 @@
-//! Library part of Battery Tray (`#![no_std]` in release): pure Win32 bindings, HID + BT readers, widget.
+//! Library part of katt (`#![no_std]` in release): pure Win32 bindings, HID + BT readers, widget.
 
 #![cfg_attr(not(test), no_std)]
 

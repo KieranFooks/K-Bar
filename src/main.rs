@@ -1,4 +1,4 @@
-//! Battery Tray — ultra-minimal `#![no_std]` + `#![no_main]` Windows 11 taskbar utility.
+//! katt, an ultra-minimal `#![no_std]` + `#![no_main]` Windows 11 taskbar utility.
 //!
 //! Displays wireless peripheral battery levels in a passive click-through taskbar block
 //! using only `kernel32`, `kernelbase`, `cfgmgr32`, `imm32`, `user32`, and `gdi32` (`-nostdlib`).
@@ -15,9 +15,9 @@ use core::panic::PanicInfo;
 use core::ptr::{addr_of_mut, null, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use battery_tray::hid::{BatteryList, HidScanner, PollOutput};
-use battery_tray::widget::WidgetWindow;
-use battery_tray::win32::{
+use katt::hid::{BatteryList, HidScanner, PollOutput};
+use katt::widget::WidgetWindow;
+use katt::win32::{
     CloseHandle, CreateEventW, CreateMutexW, CreateThread, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, ExitProcess, GetDesktopWindow, GetLastError, GetMessageW,
     GetModuleHandleW, GetWindowThreadProcessId, ImmDisableIME, KillTimer, PostMessageW,
@@ -31,7 +31,7 @@ use battery_tray::win32::{
     WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_POWERBROADCAST, WM_SETTINGCHANGE,
     WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
-use battery_tray::{
+use katt::{
     light_theme, merge_devices, w, widget, WM_POLL_DONE, WM_POLL_NOW, WM_SYNC_WIDGET,
 };
 
@@ -469,7 +469,7 @@ pub extern "system" fn mainCRTStartup() -> ! {
         let _ = ImmDisableIME(0xFFFF_FFFF);
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-        let instance_mutex = CreateMutexW(null(), 0, w!("Local\\BatteryTray.SingleInstance"));
+        let instance_mutex = CreateMutexW(null(), 0, w!("Local\\katt.SingleInstance"));
         if instance_mutex.is_null() {
             ExitProcess(1);
         }
@@ -479,7 +479,7 @@ pub extern "system" fn mainCRTStartup() -> ! {
         }
 
         let hinst = GetModuleHandleW(null());
-        let class = w!("BatteryTrayMainClass");
+        let class = w!("KattMainClass");
         let wc = WNDCLASSW {
             lpfn_wnd_proc: Some(wndproc),
             h_instance: hinst,
@@ -492,7 +492,7 @@ pub extern "system" fn mainCRTStartup() -> ! {
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class,
-            w!("Battery Tray"),
+            w!("katt"),
             WS_OVERLAPPED,
             0,
             0,

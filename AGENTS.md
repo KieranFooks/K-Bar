@@ -1,4 +1,4 @@
-# AGENTS.md — Battery Tray
+# AGENTS.md (katt)
 
 ## Project Goal & Performance Budget
 Ultra-minimal `#![no_std]` + `#![no_main]` native Windows 11 taskbar utility written in **pure Rust** (`raw-dylib` Win32 FFI, **zero external crate dependencies**, linked with `-nostdlib`).

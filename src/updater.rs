@@ -1317,26 +1317,8 @@ pub fn is_version_skipped(tag: &str) -> bool {
 }
 
 /// Persist `HKCU\Software\katt\SkippedVersion` via ephemeral `advapi32.dll`.
-#[inline(never)]
 pub fn save_skipped_version(tag: &str) {
-    const REG_OPTION_NON_VOLATILE: u32 = 0;
-    const KEY_SET_VALUE: u32 = 0x0002;
     const REG_SZ: u32 = 1;
-
-    type FnRegCreateKeyExW = unsafe extern "system" fn(
-        isize,
-        *const u16,
-        u32,
-        *const u16,
-        u32,
-        u32,
-        *const c_void,
-        *mut isize,
-        *mut u32,
-    ) -> i32;
-    type FnRegSetValueExW =
-        unsafe extern "system" fn(isize, *const u16, u32, u32, *const u8, u32) -> i32;
-    type FnRegCloseKey = unsafe extern "system" fn(isize) -> i32;
 
     let mut tag_w = [0u16; 64];
     if !ascii_to_utf16z(tag, &mut tag_w) {
@@ -1345,43 +1327,12 @@ pub fn save_skipped_version(tag: &str) {
     let byte_len = ((tag.len() + 1) * 2) as u32;
 
     unsafe {
-        let adv = LoadLibraryW(w!("advapi32.dll"));
-        if adv.is_null() {
-            return;
-        }
-        let p_create = GetProcAddress(adv, c"RegCreateKeyExW".as_ptr().cast::<u8>());
-        let p_set = GetProcAddress(adv, c"RegSetValueExW".as_ptr().cast::<u8>());
-        let p_close = GetProcAddress(adv, c"RegCloseKey".as_ptr().cast::<u8>());
-        if !p_create.is_null() && !p_set.is_null() && !p_close.is_null() {
-            let reg_create: FnRegCreateKeyExW = transmute(p_create);
-            let reg_set: FnRegSetValueExW = transmute(p_set);
-            let reg_close: FnRegCloseKey = transmute(p_close);
-
-            let mut hkey: isize = 0;
-            if reg_create(
-                HKEY_CURRENT_USER,
-                w!("Software\\katt"),
-                0,
-                null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE,
-                null(),
-                &mut hkey,
-                null_mut(),
-            ) == ERROR_SUCCESS
-            {
-                let _ = reg_set(
-                    hkey,
-                    w!("SkippedVersion"),
-                    0,
-                    REG_SZ,
-                    tag_w.as_ptr() as *const u8,
-                    byte_len,
-                );
-                let _ = reg_close(hkey);
-            }
-        }
-        let _ = FreeLibrary(adv);
+        crate::save_hkcu_katt_value(
+            w!("SkippedVersion"),
+            REG_SZ,
+            tag_w.as_ptr() as *const u8,
+            byte_len,
+        );
     }
 }
 

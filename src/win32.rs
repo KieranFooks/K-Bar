@@ -453,9 +453,11 @@ pub const WM_NCHITTEST: u32 = 0x0084;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_POWERBROADCAST: u32 = 0x0218;
 pub const WM_DEVICECHANGE: u32 = 0x0219;
+pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const WM_DPICHANGED: u32 = 0x02E0;
 pub const MA_NOACTIVATE: isize = 3;
-pub const HTTRANSPARENT: isize = -1;
+pub const HTCLIENT: isize = 1;
+pub const IDC_ARROW: *const u16 = 32512usize as *const u16;
 pub const PBT_APMRESUMESUSPEND: usize = 0x0007;
 pub const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 
@@ -745,6 +747,7 @@ extern "system" {
         caption: *const u16,
         utype: u32,
     ) -> i32;
+    pub fn LoadCursorW(inst: HINSTANCE, name: *const u16) -> HANDLE;
 }
 
 #[link(name = "gdi32", kind = "raw-dylib")]

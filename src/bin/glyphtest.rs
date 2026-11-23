@@ -99,31 +99,33 @@ fn main() {
     let cell_w = 480usize;
     let cell_h = 200usize;
     let cols = cases.len();
-    let rows = dpis.len() * 2;
+    let rows = dpis.len() * 4;
     let width = cols * cell_w;
     let height = rows * cell_h;
     let mut canvas = vec![0x20u8; width * height * 3];
 
     for (di, &dpi) in dpis.iter().enumerate() {
-        for (ti, &light) in [false, true].iter().enumerate() {
-            let row = di * 2 + ti;
-            let bg = if light { (0xEF, 0xEF, 0xEF) } else { (0x1F, 0x1B, 0x33) };
+        for (mi, &show_icons) in [false, true].iter().enumerate() {
+            for (ti, &light) in [false, true].iter().enumerate() {
+                let row = di * 4 + mi * 2 + ti;
+                let bg = if light { (0xEF, 0xEF, 0xEF) } else { (0x1F, 0x1B, 0x33) };
 
-            for (col, devs) in cases.iter().enumerate() {
-                let x0 = col * cell_w;
-                let y0 = row * cell_h;
-                for y in y0..(y0 + cell_h) {
-                    for x in x0..(x0 + cell_w) {
-                        let idx = (y * width + x) * 3;
-                        canvas[idx] = bg.0;
-                        canvas[idx + 1] = bg.1;
-                        canvas[idx + 2] = bg.2;
+                for (col, devs) in cases.iter().enumerate() {
+                    let x0 = col * cell_w;
+                    let y0 = row * cell_h;
+                    for y in y0..(y0 + cell_h) {
+                        for x in x0..(x0 + cell_w) {
+                            let idx = (y * width + x) * 3;
+                            canvas[idx] = bg.0;
+                            canvas[idx + 1] = bg.1;
+                            canvas[idx + 2] = bg.2;
+                        }
                     }
-                }
 
-                let (ew, eh) = widget::widget_dimensions(devs, dpi);
-                let mut bgra = vec![0u8; (ew * eh * 4) as usize];
-                let (w, h) = widget::render_widget_premul_bgra(devs, dpi, light, &mut bgra);
+                    let (ew, eh) = widget::widget_dimensions(devs, dpi, show_icons);
+                    let mut bgra = vec![0u8; (ew * eh * 4) as usize];
+                    let (w, h) =
+                        widget::render_widget_premul_bgra(devs, dpi, light, show_icons, &mut bgra);
                 let wu = w as usize;
                 let hu = h as usize;
 
@@ -139,21 +141,22 @@ fn main() {
                     }
                 }
 
-                let zoom = 2usize;
-                let zx0 = x0 + 10;
-                let zy0 = y0 + 16 + hu;
-                for py in 0..hu {
-                    for px in 0..wu {
-                        let c = blend_premul_bgra_on_bg(bg, &bgra, py * wu + px);
-                        for zy in 0..zoom {
-                            for zx in 0..zoom {
-                                let dx = zx0 + px * zoom + zx;
-                                let dy = zy0 + py * zoom + zy;
-                                if dx < x0 + cell_w && dy < y0 + cell_h {
-                                    let idx = (dy * width + dx) * 3;
-                                    canvas[idx] = c.0;
-                                    canvas[idx + 1] = c.1;
-                                    canvas[idx + 2] = c.2;
+                    let zoom = 2usize;
+                    let zx0 = x0 + 10;
+                    let zy0 = y0 + 16 + hu;
+                    for py in 0..hu {
+                        for px in 0..wu {
+                            let c = blend_premul_bgra_on_bg(bg, &bgra, py * wu + px);
+                            for zy in 0..zoom {
+                                for zx in 0..zoom {
+                                    let dx = zx0 + px * zoom + zx;
+                                    let dy = zy0 + py * zoom + zy;
+                                    if dx < x0 + cell_w && dy < y0 + cell_h {
+                                        let idx = (dy * width + dx) * 3;
+                                        canvas[idx] = c.0;
+                                        canvas[idx + 1] = c.1;
+                                        canvas[idx + 2] = c.2;
+                                    }
                                 }
                             }
                         }

@@ -10,9 +10,14 @@ pub mod widget;
 pub mod win32;
 
 use core::ffi::c_void;
+use core::mem::transmute;
+use core::ptr::{null, null_mut};
 
 use hid::{BatteryList, Source};
-use win32::{RegGetValueW, ERROR_SUCCESS, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use win32::{
+    FreeLibrary, GetProcAddress, LoadLibraryW, RegGetValueW, ERROR_SUCCESS, HKEY_CURRENT_USER,
+    RRF_RT_REG_DWORD,
+};
 
 /// Custom window messages handled by the main hidden window.
 pub const WM_POLL_NOW: u32 = 0x8000 + 2;
@@ -20,23 +25,111 @@ pub const WM_SYNC_WIDGET: u32 = 0x8000 + 3;
 pub const WM_POLL_DONE: u32 = 0x8000 + 4;
 pub const WM_UPDATE_AVAILABLE: u32 = 0x8000 + 5;
 pub const WM_UPDATE_READY: u32 = 0x8000 + 6;
+pub const WM_TOGGLE_DISPLAY_MODE: u32 = 0x8000 + 7;
+
+unsafe fn read_hkcu_dword_flag(subkey: *const u16, value: *const u16) -> bool {
+    let mut data = 0u32;
+    let mut cb = core::mem::size_of::<u32>() as u32;
+    let mut ty = 0u32;
+    let r = RegGetValueW(
+        HKEY_CURRENT_USER,
+        subkey,
+        value,
+        RRF_RT_REG_DWORD,
+        &mut ty,
+        &mut data as *mut u32 as *mut c_void,
+        &mut cb,
+    );
+    r == ERROR_SUCCESS && data != 0
+}
 
 /// `HKCU\...\Personalize\SystemUsesLightTheme` via `kernelbase.dll` (avoids `advapi32.dll`).
 pub fn light_theme() -> bool {
     unsafe {
-        let mut data = 0u32;
-        let mut cb = core::mem::size_of::<u32>() as u32;
-        let mut ty = 0u32;
-        let r = RegGetValueW(
-            HKEY_CURRENT_USER,
+        read_hkcu_dword_flag(
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
             w!("SystemUsesLightTheme"),
-            RRF_RT_REG_DWORD,
-            &mut ty,
-            &mut data as *mut u32 as *mut c_void,
-            &mut cb,
+        )
+    }
+}
+
+/// Read persisted `HKCU\Software\katt\BatteryIcons` preference (`false` = percentages).
+pub fn load_battery_icons_pref() -> bool {
+    unsafe { read_hkcu_dword_flag(w!("Software\\katt"), w!("BatteryIcons")) }
+}
+
+/// Persist a value under `HKCU\Software\katt` via ephemeral `advapi32.dll` (zero static import).
+///
+/// # Safety
+/// `value_name` must be a valid NUL-terminated UTF-16 string and `data` must be readable for `byte_len` bytes.
+#[inline(never)]
+pub unsafe fn save_hkcu_katt_value(
+    value_name: *const u16,
+    value_type: u32,
+    data: *const u8,
+    byte_len: u32,
+) {
+    const REG_OPTION_NON_VOLATILE: u32 = 0;
+    const KEY_SET_VALUE: u32 = 0x0002;
+
+    type FnRegCreateKeyExW = unsafe extern "system" fn(
+        isize,
+        *const u16,
+        u32,
+        *const u16,
+        u32,
+        u32,
+        *const c_void,
+        *mut isize,
+        *mut u32,
+    ) -> i32;
+    type FnRegSetValueExW =
+        unsafe extern "system" fn(isize, *const u16, u32, u32, *const u8, u32) -> i32;
+    type FnRegCloseKey = unsafe extern "system" fn(isize) -> i32;
+
+    let adv = LoadLibraryW(w!("advapi32.dll"));
+    if adv.is_null() {
+        return;
+    }
+    let p_create = GetProcAddress(adv, c"RegCreateKeyExW".as_ptr().cast::<u8>());
+    let p_set = GetProcAddress(adv, c"RegSetValueExW".as_ptr().cast::<u8>());
+    let p_close = GetProcAddress(adv, c"RegCloseKey".as_ptr().cast::<u8>());
+    if !p_create.is_null() && !p_set.is_null() && !p_close.is_null() {
+        let reg_create: FnRegCreateKeyExW = transmute(p_create);
+        let reg_set: FnRegSetValueExW = transmute(p_set);
+        let reg_close: FnRegCloseKey = transmute(p_close);
+
+        let mut hkey: isize = 0;
+        if reg_create(
+            HKEY_CURRENT_USER,
+            w!("Software\\katt"),
+            0,
+            null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            null(),
+            &mut hkey,
+            null_mut(),
+        ) == ERROR_SUCCESS
+        {
+            let _ = reg_set(hkey, value_name, 0, value_type, data, byte_len);
+            let _ = reg_close(hkey);
+        }
+    }
+    let _ = FreeLibrary(adv);
+}
+
+/// Persist `HKCU\Software\katt\BatteryIcons` (`REG_DWORD`) across reboots and updates.
+pub fn save_battery_icons_pref(enabled: bool) {
+    const REG_DWORD: u32 = 4;
+    let val: u32 = u32::from(enabled);
+    unsafe {
+        save_hkcu_katt_value(
+            w!("BatteryIcons"),
+            REG_DWORD,
+            &val as *const u32 as *const u8,
+            core::mem::size_of::<u32>() as u32,
         );
-        r == ERROR_SUCCESS && data != 0
     }
 }
 

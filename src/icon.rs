@@ -9,8 +9,12 @@ use crate::win32::{
     OUT_DEFAULT_PRECIS,
 };
 
-/// Battery0 fallback glyph when no devices are detected.
+/// Battery0 fallback / discharging base glyph (`0xEBA0`..=`0xEBAA`, steps 0..=10).
 pub const BATTERY_BASE: u16 = 0xEBA0;
+/// BatteryCharging0 base glyph (`0xEBAB`..=`0xEBB5`, steps 0..=10).
+pub const BATTERY_CHARGING_BASE: u16 = 0xEBAB;
+/// BatteryUnknown glyph (`0xEC02`, battery outline with X).
+pub const BATTERY_UNKNOWN: u16 = 0xEC02;
 /// Mouse glyph.
 pub const MOUSE: u16 = 0xE962;
 /// Keyboard glyph (rounded Fluent keyboard outline).
@@ -29,6 +33,21 @@ pub const fn kind_glyph(kind: Kind) -> u16 {
         Kind::Headset => HEADSET,
         Kind::Gamepad => GAMEPAD,
     }
+}
+
+/// Map `(pct, charging)` to the corresponding `Segoe Fluent Icons` battery glyph (`0..=10` steps).
+pub const fn battery_glyph(pct: Option<u8>, charging: bool) -> u16 {
+    let Some(raw) = pct else {
+        return BATTERY_UNKNOWN;
+    };
+    let p = if raw > 100 { 100 } else { raw } as u16;
+    let step = (p + 5) / 10;
+    let base = if charging {
+        BATTERY_CHARGING_BASE
+    } else {
+        BATTERY_BASE
+    };
+    base + step
 }
 
 /// Format `"86 %"`, `"100 %"`, or `"--"` directly into a stack UTF-16 buffer (no `core::fmt`).
@@ -88,6 +107,7 @@ pub struct FontCache {
     pub dpi: u32,
     pub glyph: HFONT,
     pub bolt: HFONT,
+    pub battery: HFONT,
     pub text: HFONT,
 }
 
@@ -103,6 +123,7 @@ impl FontCache {
             dpi: 0,
             glyph: null_mut(),
             bolt: null_mut(),
+            battery: null_mut(),
             text: null_mut(),
         }
     }
@@ -112,13 +133,18 @@ impl FontCache {
     /// # Safety
     /// Must be called on the UI thread with GDI access.
     pub unsafe fn ensure_dpi(&mut self, dpi: u32) {
-        if self.dpi == dpi && !self.glyph.is_null() && !self.text.is_null() {
+        if self.dpi == dpi
+            && !self.glyph.is_null()
+            && !self.battery.is_null()
+            && !self.text.is_null()
+        {
             return;
         }
         self.clear();
         self.dpi = dpi;
         self.glyph = make_glyph_font(-scale_dip(11, dpi));
         self.bolt = make_glyph_font(-scale_dip(10, dpi));
+        self.battery = make_glyph_font(-scale_dip(14, dpi));
         self.text = make_font(-scale_dip(12, dpi), w!("Segoe UI"));
     }
 
@@ -127,13 +153,14 @@ impl FontCache {
     /// # Safety
     /// Must be called on the UI thread when fonts are no longer selected into any DC.
     pub unsafe fn clear(&mut self) {
-        for f in [self.glyph, self.bolt, self.text] {
+        for f in [self.glyph, self.bolt, self.battery, self.text] {
             if !f.is_null() {
                 let _ = DeleteObject(f);
             }
         }
         self.glyph = null_mut();
         self.bolt = null_mut();
+        self.battery = null_mut();
         self.text = null_mut();
         self.dpi = 0;
     }
@@ -164,5 +191,23 @@ mod tests {
 
         let n = format_pct_utf16(Some(150), &mut buf);
         assert_eq!(to_s(n, &buf), "100 %");
+    }
+
+    #[test]
+    fn battery_glyph_maps_steps_charging_and_unknown() {
+        assert_eq!(battery_glyph(None, false), BATTERY_UNKNOWN);
+        assert_eq!(battery_glyph(None, true), BATTERY_UNKNOWN);
+
+        assert_eq!(battery_glyph(Some(0), false), BATTERY_BASE);
+        assert_eq!(battery_glyph(Some(4), false), BATTERY_BASE);
+        assert_eq!(battery_glyph(Some(5), false), BATTERY_BASE + 1);
+        assert_eq!(battery_glyph(Some(50), false), BATTERY_BASE + 5);
+        assert_eq!(battery_glyph(Some(86), false), BATTERY_BASE + 9);
+        assert_eq!(battery_glyph(Some(95), false), BATTERY_BASE + 10);
+        assert_eq!(battery_glyph(Some(150), false), BATTERY_BASE + 10);
+
+        assert_eq!(battery_glyph(Some(0), true), BATTERY_CHARGING_BASE);
+        assert_eq!(battery_glyph(Some(50), true), BATTERY_CHARGING_BASE + 5);
+        assert_eq!(battery_glyph(Some(100), true), BATTERY_CHARGING_BASE + 10);
     }
 }

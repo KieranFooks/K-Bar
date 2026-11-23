@@ -34,8 +34,9 @@ use katt::win32::{
     WS_OVERLAPPED,
 };
 use katt::{
-    light_theme, merge_devices, w, widget, WM_POLL_DONE, WM_POLL_NOW, WM_SYNC_WIDGET,
-    WM_UPDATE_AVAILABLE, WM_UPDATE_READY,
+    light_theme, load_battery_icons_pref, merge_devices, save_battery_icons_pref, w, widget,
+    WM_POLL_DONE, WM_POLL_NOW, WM_SYNC_WIDGET, WM_TOGGLE_DISPLAY_MODE, WM_UPDATE_AVAILABLE,
+    WM_UPDATE_READY,
 };
 
 const POLL_TIMER_ID: usize = 100;
@@ -85,6 +86,7 @@ struct AppState {
     syncing: bool,
     devices: BatteryList,
     light_theme: bool,
+    show_battery_icons: bool,
     tray_pid: u32,
     tray_tid: u32,
     tray_loc_hook: HWINEVENTHOOK,
@@ -98,6 +100,7 @@ impl AppState {
         dst: *mut Self,
         main: HWND,
         light: bool,
+        show_battery_icons: bool,
         worker_thread: HANDLE,
         poll_event: HANDLE,
     ) {
@@ -107,6 +110,7 @@ impl AppState {
         addr_of_mut!((*dst).syncing).write(false);
         addr_of_mut!((*dst).devices).write(BatteryList::new());
         addr_of_mut!((*dst).light_theme).write(light);
+        addr_of_mut!((*dst).show_battery_icons).write(show_battery_icons);
         addr_of_mut!((*dst).tray_pid).write(0);
         addr_of_mut!((*dst).tray_tid).write(0);
         addr_of_mut!((*dst).tray_loc_hook).write(null_mut());
@@ -247,7 +251,7 @@ unsafe fn update_tray_tracking(tray_hwnd: Option<HWND>, notify_hwnd: Option<HWND
 }
 
 unsafe fn sync_widget(force_redraw: bool) {
-    let (main, mut slot, devices, light) = {
+    let (main, mut slot, devices, light, show_battery_icons) = {
         let Some(state) = app_mut() else { return };
         if !state.active || state.syncing {
             return;
@@ -258,11 +262,18 @@ unsafe fn sync_widget(force_redraw: bool) {
             state.widget.take(),
             state.devices,
             state.light_theme,
+            state.show_battery_icons,
         )
     };
 
-    let (tray_hwnd, notify_hwnd) =
-        widget::sync_position(main, &mut slot, &devices, light, force_redraw);
+    let (tray_hwnd, notify_hwnd) = widget::sync_position(
+        main,
+        &mut slot,
+        &devices,
+        light,
+        show_battery_icons,
+        force_redraw,
+    );
 
     let mut leftover = None;
     if let Some(state) = app_mut() {
@@ -622,6 +633,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             apply_ready_update(hwnd);
             0
         }
+        WM_TOGGLE_DISPLAY_MODE => {
+            let new_mode = if let Some(state) = app_mut() {
+                if state.active {
+                    state.show_battery_icons = !state.show_battery_icons;
+                    Some(state.show_battery_icons)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(enabled) = new_mode {
+                sync_widget(true);
+                save_battery_icons_pref(enabled);
+            }
+            0
+        }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
             sync_widget(true);
             0
@@ -792,6 +820,7 @@ pub extern "system" fn mainCRTStartup() -> ! {
             (*APP.get()).as_mut_ptr(),
             hwnd,
             light_theme(),
+            load_battery_icons_pref(),
             worker_thread,
             poll_event,
         );

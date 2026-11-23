@@ -1,8 +1,8 @@
 //! Unified 2-row × N-column Windows 11 taskbar block (`#![no_std]`, zero heap allocations, single-DIB renderer).
 //!
-//! Renders as a single `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
-//! WS_EX_TOOLWINDOW` popup owned by `Shell_TrayWnd`, so `win32k` maintains atomic
-//! Z-order above the taskbar with zero focus flicker.
+//! Renders as a single `WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` popup
+//! owned by `Shell_TrayWnd`, so `win32k` maintains atomic Z-order above the taskbar
+//! with zero focus flicker while still accepting clicks to toggle display modes.
 
 use core::ffi::c_void;
 use core::ptr::{null, null_mut};
@@ -15,16 +15,16 @@ use crate::win32::{
     DeleteObject, DestroyWindow, DrawTextW, FindWindowExW, FindWindowW, GetClassNameW, GetDC,
     GetDpiForWindow, GetForegroundWindow, GetLayeredWindowAttributes, GetModuleHandleW,
     GetMonitorInfoW, GetWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow,
-    IsWindowVisible, IsZoomed, MonitorFromWindow, RegisterClassW, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, SetWindowPos, SingleThreadCell, UpdateLayeredWindow, AC_SRC_ALPHA,
-    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER,
-    DT_NOCLIP, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, GWL_EXSTYLE, GWL_STYLE,
-    GW_HWNDPREV, HBITMAP, HDC, HGDIOBJ, HTTRANSPARENT, HWND, HWND_TOPMOST, LWA_ALPHA,
-    MA_NOACTIVATE, MONITORINFO, MONITOR_DEFAULTTONEAREST, POINT, RECT, SIZE, SWP_HIDEWINDOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    TRANSPARENT, ULW_ALPHA, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSW, WS_CAPTION,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP, WS_THICKFRAME,
+    IsWindowVisible, IsZoomed, LoadCursorW, MonitorFromWindow, PostMessageW, RegisterClassW,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, SetWindowPos, SingleThreadCell,
+    UpdateLayeredWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_NOCLIP, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
+    DT_VCENTER, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HBITMAP, HDC, HGDIOBJ, HTCLIENT, HWND,
+    HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    POINT, RECT, SIZE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, TRANSPARENT, ULW_ALPHA, WM_ERASEBKGND, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +40,7 @@ struct RenderKey {
     count: u8,
     dpi: u32,
     light_theme: bool,
+    show_battery_icons: bool,
     x: i32,
     y: i32,
     w: i32,
@@ -53,6 +54,7 @@ impl RenderKey {
             count: 0,
             dpi: 0,
             light_theme: false,
+            show_battery_icons: false,
             x: 0,
             y: 0,
             w: 0,
@@ -80,6 +82,7 @@ static CLASS_REGISTERED: SingleThreadCell<bool> = SingleThreadCell::new(false);
 static LAST_RENDER: SingleThreadCell<RenderCache> = SingleThreadCell::new(RenderCache::empty());
 static LAST_OWNER_ATTEMPT: SingleThreadCell<usize> = SingleThreadCell::new(0);
 static FONTS: SingleThreadCell<FontCache> = SingleThreadCell::new(FontCache::empty());
+static WIDGET_MAIN_HWND: SingleThreadCell<HWND> = SingleThreadCell::new(null_mut());
 
 fn col_has_bolt(devices: &BatteryList, col: usize) -> bool {
     let i0 = col * 2;
@@ -89,19 +92,26 @@ fn col_has_bolt(devices: &BatteryList, col: usize) -> bool {
     b0 || b1
 }
 
-fn col_width(devices: &BatteryList, col: usize, dpi: u32) -> i32 {
-    if col_has_bolt(devices, col) {
+fn col_width(devices: &BatteryList, col: usize, dpi: u32, show_battery_icons: bool) -> i32 {
+    if show_battery_icons {
+        scale_dip(34, dpi)
+    } else if col_has_bolt(devices, col) {
         scale_dip(68, dpi)
     } else {
         scale_dip(56, dpi)
     }
 }
 
-pub fn widget_dimensions(devices: &BatteryList, dpi: u32) -> (i32, i32) {
+pub fn widget_dimensions(
+    devices: &BatteryList,
+    dpi: u32,
+    show_battery_icons: bool,
+) -> (i32, i32) {
     let count = devices.count();
     let h = scale_dip(38, dpi);
     if count == 0 {
-        return (scale_dip(72, dpi), h);
+        let empty_w = if show_battery_icons { 36 } else { 72 };
+        return (scale_dip(empty_w, dpi), h);
     }
     let cols = if count <= 2 { 1 } else { count.div_ceil(2) };
     let pad_x = scale_dip(8, dpi);
@@ -109,7 +119,7 @@ pub fn widget_dimensions(devices: &BatteryList, dpi: u32) -> (i32, i32) {
     let mut w = pad_x * 2 + col_gap * (cols as i32 - 1);
     let mut c = 0;
     while c < cols {
-        w += col_width(devices, c, dpi);
+        w += col_width(devices, c, dpi, show_battery_icons);
         c += 1;
     }
     (w, h)
@@ -182,8 +192,9 @@ unsafe fn draw_widget_to_dib(
     devices: &BatteryList,
     dpi: u32,
     light_theme: bool,
+    show_battery_icons: bool,
 ) -> Option<(HDC, HDC, HBITMAP, HGDIOBJ, *mut u8, i32, i32)> {
-    let (w, h) = widget_dimensions(devices, dpi);
+    let (w, h) = widget_dimensions(devices, dpi, show_battery_icons);
     let screen = GetDC(null_mut());
     if screen.is_null() {
         return None;
@@ -235,40 +246,60 @@ unsafe fn draw_widget_to_dib(
 
     if devices.is_empty() {
         let ry = (h - row_h) / 2;
-        if !fonts.glyph.is_null() {
-            SelectObject(memdc, fonts.glyph);
-            let ch = icon::BATTERY_BASE;
-            let mut rc = RECT {
-                left: pad_x,
-                top: ry,
-                right: pad_x + glyph_w,
-                bottom: ry + row_h,
-            };
-            let _ = DrawTextW(
-                memdc,
-                &ch,
-                1,
-                &mut rc,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
-            );
-        }
-        if !fonts.text.is_null() {
-            SelectObject(memdc, fonts.text);
-            let mut txt = [0u16; 8];
-            let tlen = icon::format_pct_utf16(None, &mut txt);
-            let mut rc = RECT {
-                left: pad_x + glyph_w + sc(2),
-                top: ry,
-                right: w - pad_x,
-                bottom: ry + row_h,
-            };
-            let _ = DrawTextW(
-                memdc,
-                txt.as_ptr(),
-                tlen as i32,
-                &mut rc,
-                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
+        if show_battery_icons {
+            if !fonts.battery.is_null() {
+                SelectObject(memdc, fonts.battery);
+                let ch = icon::BATTERY_UNKNOWN;
+                let mut rc = RECT {
+                    left: pad_x,
+                    top: ry,
+                    right: w - pad_x,
+                    bottom: ry + row_h,
+                };
+                let _ = DrawTextW(
+                    memdc,
+                    &ch,
+                    1,
+                    &mut rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
+                );
+            }
+        } else {
+            if !fonts.glyph.is_null() {
+                SelectObject(memdc, fonts.glyph);
+                let ch = icon::BATTERY_BASE;
+                let mut rc = RECT {
+                    left: pad_x,
+                    top: ry,
+                    right: pad_x + glyph_w,
+                    bottom: ry + row_h,
+                };
+                let _ = DrawTextW(
+                    memdc,
+                    &ch,
+                    1,
+                    &mut rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
+                );
+            }
+            if !fonts.text.is_null() {
+                SelectObject(memdc, fonts.text);
+                let mut txt = [0u16; 8];
+                let tlen = icon::format_pct_utf16(None, &mut txt);
+                let mut rc = RECT {
+                    left: pad_x + glyph_w + sc(2),
+                    top: ry,
+                    right: w - pad_x,
+                    bottom: ry + row_h,
+                };
+                let _ = DrawTextW(
+                    memdc,
+                    txt.as_ptr(),
+                    tlen as i32,
+                    &mut rc,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
         }
     } else {
         let count = devices.count();
@@ -278,7 +309,7 @@ unsafe fn draw_widget_to_dib(
         let mut col_x = pad_x;
 
         for c in 0..cols {
-            let cw = col_width(devices, c, dpi);
+            let cw = col_width(devices, c, dpi, show_battery_icons);
             for r in 0..2 {
                 let idx = c * 2 + r;
                 let Some(d) = devices.items.get(idx).copied().flatten() else {
@@ -304,16 +335,14 @@ unsafe fn draw_widget_to_dib(
                     );
                 }
 
-                let mut text_x = col_x + glyph_w + sc(2);
-                if d.charging {
-                    let bolt_w = sc(10);
-                    if !fonts.bolt.is_null() {
-                        SelectObject(memdc, fonts.bolt);
-                        let ch = icon::BOLT;
+                if show_battery_icons {
+                    if !fonts.battery.is_null() {
+                        SelectObject(memdc, fonts.battery);
+                        let ch = icon::battery_glyph(d.pct, d.charging);
                         let mut rc = RECT {
-                            left: text_x,
+                            left: col_x + glyph_w + sc(3),
                             top: ry,
-                            right: text_x + bolt_w,
+                            right: col_x + cw,
                             bottom: ry + row_h,
                         };
                         let _ = DrawTextW(
@@ -324,26 +353,48 @@ unsafe fn draw_widget_to_dib(
                             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
                         );
                     }
-                    text_x += bolt_w + sc(1);
-                }
+                } else {
+                    let mut text_x = col_x + glyph_w + sc(2);
+                    if d.charging {
+                        let bolt_w = sc(10);
+                        if !fonts.bolt.is_null() {
+                            SelectObject(memdc, fonts.bolt);
+                            let ch = icon::BOLT;
+                            let mut rc = RECT {
+                                left: text_x,
+                                top: ry,
+                                right: text_x + bolt_w,
+                                bottom: ry + row_h,
+                            };
+                            let _ = DrawTextW(
+                                memdc,
+                                &ch,
+                                1,
+                                &mut rc,
+                                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
+                            );
+                        }
+                        text_x += bolt_w + sc(1);
+                    }
 
-                if !fonts.text.is_null() {
-                    SelectObject(memdc, fonts.text);
-                    let mut txt = [0u16; 8];
-                    let tlen = icon::format_pct_utf16(d.pct, &mut txt);
-                    let mut rc = RECT {
-                        left: text_x,
-                        top: ry,
-                        right: col_x + cw,
-                        bottom: ry + row_h,
-                    };
-                    let _ = DrawTextW(
-                        memdc,
-                        txt.as_ptr(),
-                        tlen as i32,
-                        &mut rc,
-                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                    );
+                    if !fonts.text.is_null() {
+                        SelectObject(memdc, fonts.text);
+                        let mut txt = [0u16; 8];
+                        let tlen = icon::format_pct_utf16(d.pct, &mut txt);
+                        let mut rc = RECT {
+                            left: text_x,
+                            top: ry,
+                            right: col_x + cw,
+                            bottom: ry + row_h,
+                        };
+                        let _ = DrawTextW(
+                            memdc,
+                            txt.as_ptr(),
+                            tlen as i32,
+                            &mut rc,
+                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                        );
+                    }
                 }
             }
             col_x += cw + col_gap;
@@ -353,15 +404,25 @@ unsafe fn draw_widget_to_dib(
     SelectObject(memdc, old_font);
 
     // Convert grayscale anti-aliased GDI coverage into premultiplied monochrome BGRA in-place.
+    // Keep alpha >= 1 across the widget rectangle so layered hit-testing catches clicks in glyph gaps,
+    // matching light/dark background luma so the 1/255 alpha leaves zero visible tint.
     let fg_val: u16 = if light_theme { 24 } else { 245 };
+    let empty_c = u8::from(light_theme);
     let px_bytes = core::slice::from_raw_parts_mut(bits as *mut u8, byte_len);
     for px in px_bytes.as_chunks_mut::<4>().0.iter_mut() {
         let a = (px[0] as u16 + px[1] as u16 + px[2] as u16) / 3;
-        let c = ((fg_val * a + 127) / 255) as u8;
-        px[0] = c;
-        px[1] = c;
-        px[2] = c;
-        px[3] = a as u8;
+        if a == 0 {
+            px[0] = empty_c;
+            px[1] = empty_c;
+            px[2] = empty_c;
+            px[3] = 1;
+        } else {
+            let c = ((fg_val * a + 127) / 255) as u8;
+            px[0] = c;
+            px[1] = c;
+            px[2] = c;
+            px[3] = a as u8;
+        }
     }
 
     Some((screen, memdc, bmp, old_bmp, bits as *mut u8, w, h))
@@ -374,10 +435,11 @@ unsafe fn present_widget(
     devices: &BatteryList,
     dpi: u32,
     light_theme: bool,
+    show_battery_icons: bool,
 ) -> bool {
     let fonts = &mut *FONTS.get();
     let Some((screen, memdc, bmp, old_bmp, _bits, w, h)) =
-        draw_widget_to_dib(fonts, devices, dpi, light_theme)
+        draw_widget_to_dib(fonts, devices, dpi, light_theme, show_battery_icons)
     else {
         return false;
     };
@@ -417,11 +479,12 @@ pub fn render_widget_premul_bgra(
     devices: &BatteryList,
     dpi: u32,
     light_theme: bool,
+    show_battery_icons: bool,
     out_bgra: &mut [u8],
 ) -> (i32, i32) {
     unsafe {
         let mut fonts = FontCache::empty();
-        let res = draw_widget_to_dib(&mut fonts, devices, dpi, light_theme);
+        let res = draw_widget_to_dib(&mut fonts, devices, dpi, light_theme, show_battery_icons);
         let dims = if let Some((screen, memdc, bmp, old_bmp, bits, w, h)) = res {
             let byte_len = ((w * h * 4) as usize).min(out_bgra.len());
             let src = core::slice::from_raw_parts(bits, byte_len);
@@ -593,7 +656,7 @@ unsafe fn is_above_taskbar(widget: HWND, tray: HWND) -> bool {
     false
 }
 
-/// Create the unified passive layered taskbar block window, owned by `owner_tray`.
+/// Create the unified clickable layered taskbar block window, owned by `owner_tray`.
 ///
 /// # Safety
 /// Must be called on the UI thread.
@@ -604,6 +667,7 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
         let wc = WNDCLASSW {
             lpfn_wnd_proc: Some(widget_proc),
             h_instance: hinst,
+            h_cursor: LoadCursorW(null_mut(), IDC_ARROW),
             lpsz_class_name: w!("KattWidgetClass"),
             ..Default::default()
         };
@@ -613,7 +677,7 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
 
     if let Some(owner) = owner_tray {
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("KattWidgetClass"),
             w!("katt"),
             WS_POPUP,
@@ -635,7 +699,7 @@ pub unsafe fn create(owner_tray: Option<HWND>) -> Option<WidgetWindow> {
     }
 
     let hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         w!("KattWidgetClass"),
         w!("katt"),
         WS_POPUP,
@@ -669,10 +733,9 @@ fn build_render_key(
     devices: &BatteryList,
     dpi: u32,
     light_theme: bool,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    show_battery_icons: bool,
+    pos: (i32, i32),
+    size: (i32, i32),
 ) -> RenderKey {
     let mut rows = [(0, 0, false); MAX_DEVICES];
     for (i, slot) in devices.items.iter().enumerate() {
@@ -683,10 +746,11 @@ fn build_render_key(
         count: devices.len as u8,
         dpi,
         light_theme,
-        x,
-        y,
-        w,
-        h,
+        show_battery_icons,
+        x: pos.0,
+        y: pos.1,
+        w: size.0,
+        h: size.1,
     }
 }
 
@@ -700,8 +764,10 @@ pub unsafe fn sync_position(
     slot: &mut Option<WidgetWindow>,
     devices: &BatteryList,
     light_theme: bool,
+    show_battery_icons: bool,
     force_redraw: bool,
 ) -> (Option<HWND>, Option<HWND>) {
+    *WIDGET_MAIN_HWND.get() = main;
     let tray_hwnd = FindWindowW(w!("Shell_TrayWnd"), null());
     if tray_hwnd.is_null() {
         if let Some(w_info) = *slot {
@@ -773,16 +839,25 @@ pub unsafe fn sync_position(
         }
     });
 
-    let (w, h) = widget_dimensions(devices, dpi);
+    let (w, h) = widget_dimensions(devices, dpi, show_battery_icons);
     let (x, y) = compute_widget_rect(tray_rc, notify_rc, w, h, dpi);
-    let key = build_render_key(devices, dpi, light_theme, x, y, w, h);
+    let key = build_render_key(
+        devices,
+        dpi,
+        light_theme,
+        show_battery_icons,
+        (x, y),
+        (w, h),
+    );
 
     let (was_valid, prev_key) = {
         let cache = &*LAST_RENDER.get();
         (cache.valid, cache.key)
     };
     let needs_redraw = recreated || force_redraw || !was_valid || prev_key != key;
-    if needs_redraw && present_widget(widget, x, y, devices, dpi, light_theme) {
+    if needs_redraw
+        && present_widget(widget, x, y, devices, dpi, light_theme, show_battery_icons)
+    {
         let cache = &mut *LAST_RENDER.get();
         cache.valid = true;
         cache.key = key;
@@ -808,6 +883,7 @@ pub unsafe fn sync_position(
 pub unsafe fn destroy(w: WidgetWindow) {
     (*LAST_RENDER.get()).valid = false;
     *LAST_OWNER_ATTEMPT.get() = 0;
+    *WIDGET_MAIN_HWND.get() = null_mut();
     (*FONTS.get()).clear();
     if IsWindow(w.hwnd) != 0 {
         let _ = DestroyWindow(w.hwnd);
@@ -818,7 +894,14 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize
     match msg {
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE,
-        WM_NCHITTEST => HTTRANSPARENT,
+        WM_NCHITTEST => HTCLIENT,
+        WM_LBUTTONUP => {
+            let main = *WIDGET_MAIN_HWND.get();
+            if !main.is_null() {
+                let _ = PostMessageW(main, crate::WM_TOGGLE_DISPLAY_MODE, 0, 0);
+            }
+            0
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -840,33 +923,43 @@ mod tests {
         two_devs.upsert(Battery::with_id(1, 0, Kind::Mouse, Some(86), false, true, Source::NativeHid));
         two_devs.upsert(Battery::with_id(3, 0, Kind::Headset, Some(100), true, true, Source::NativeHid));
 
-        assert_eq!(widget_dimensions(&BatteryList::new(), 96), (72, 38));
-        assert_eq!(widget_dimensions(&two_devs, 96), (84, 38));
-        assert_eq!(widget_dimensions(&four_devs, 96), (150, 38));
+        assert_eq!(widget_dimensions(&BatteryList::new(), 96, false), (72, 38));
+        assert_eq!(widget_dimensions(&two_devs, 96, false), (84, 38));
+        assert_eq!(widget_dimensions(&four_devs, 96, false), (150, 38));
+
+        assert_eq!(widget_dimensions(&BatteryList::new(), 96, true), (36, 38));
+        assert_eq!(widget_dimensions(&two_devs, 96, true), (50, 38));
+        assert_eq!(widget_dimensions(&four_devs, 96, true), (94, 38));
 
         for devs in [&two_devs, &four_devs] {
-            for dpi in [96u32, 144] {
-                for light in [false, true] {
-                    let (ew, eh) = widget_dimensions(devs, dpi);
-                    let byte_len = (ew * eh * 4) as usize;
-                    let mut bgra = vec![0u8; byte_len];
-                    let (w, h) = render_widget_premul_bgra(devs, dpi, light, &mut bgra);
-                    assert_eq!((w, h), (ew, eh));
+            for show_icons in [false, true] {
+                for dpi in [96u32, 144] {
+                    for light in [false, true] {
+                        let (ew, eh) = widget_dimensions(devs, dpi, show_icons);
+                        let byte_len = (ew * eh * 4) as usize;
+                        let mut bgra = vec![0u8; byte_len];
+                        let (w, h) =
+                            render_widget_premul_bgra(devs, dpi, light, show_icons, &mut bgra);
+                        assert_eq!((w, h), (ew, eh));
 
-                    let visible_px = bgra
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .filter(|p| p[3] > 60)
-                        .count();
-                    assert!(visible_px > 40, "expected visible pixels, got {visible_px}");
+                        let visible_px = bgra
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .filter(|p| p[3] > 60)
+                            .count();
+                        assert!(visible_px > 40, "expected visible pixels, got {visible_px}");
 
-                    for (i, px) in bgra.as_chunks::<4>().0.iter().enumerate() {
-                        assert!(
-                            px[0] == px[1] && px[1] == px[2] && px[0] <= px[3],
-                            "invalid premul monochrome pixel at {i}: {:?}",
-                            px
-                        );
+                        for (i, px) in bgra.as_chunks::<4>().0.iter().enumerate() {
+                            assert!(
+                                px[0] == px[1]
+                                    && px[1] == px[2]
+                                    && px[0] <= px[3]
+                                    && px[3] >= 1,
+                                "invalid premul monochrome pixel at {i}: {:?}",
+                                px
+                            );
+                        }
                     }
                 }
             }

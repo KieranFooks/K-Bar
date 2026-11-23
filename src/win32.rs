@@ -323,6 +323,7 @@ pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
 
 pub const MB_YESNO: u32 = 0x0000_0004;
 pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
+pub const MB_SETFOREGROUND: u32 = 0x0001_0000;
 pub const IDYES: i32 = 6;
 
 #[repr(C)]
@@ -698,6 +699,7 @@ extern "system" {
         flags: u32,
     ) -> BOOL;
     pub fn GetForegroundWindow() -> HWND;
+    pub fn SetForegroundWindow(hwnd: HWND) -> BOOL;
     pub fn GetWindow(hwnd: HWND, cmd: u32) -> HWND;
     pub fn GetWindowThreadProcessId(hwnd: HWND, pid: *mut u32) -> u32;
     pub fn GetClassNameW(hwnd: HWND, buf: *mut u16, max_count: i32) -> i32;

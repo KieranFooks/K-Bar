@@ -12,11 +12,11 @@ use crate::w;
 use crate::win32::{
     ActivateActCtx, CloseHandle, CreateActCtxW, CreateFileW, CreateProcessW, DeactivateActCtx,
     DeleteFileW, FreeLibrary, GetModuleFileNameW, GetProcAddress, GetTempPathW, LoadLibraryW,
-    MessageBoxW, MoveFileExW, ReadFile, RegGetValueW, ReleaseActCtx, Sleep, WriteFile, ACTCTXW,
-    BOOL, CREATE_ALWAYS, ERROR_SUCCESS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, HINSTANCE, HKEY_CURRENT_USER, HWND, IDYES, INVALID_HANDLE_VALUE,
-    MB_ICONINFORMATION, MB_YESNO, MOVEFILE_REPLACE_EXISTING, OPEN_EXISTING, PROCESS_INFORMATION,
-    RRF_RT_REG_SZ, STARTUPINFOW,
+    MessageBoxW, MoveFileExW, ReadFile, RegGetValueW, ReleaseActCtx, SetForegroundWindow, Sleep,
+    WriteFile, ACTCTXW, BOOL, CREATE_ALWAYS, ERROR_SUCCESS, FILE_ATTRIBUTE_NORMAL,
+    FILE_SHARE_READ, GENERIC_READ, GENERIC_WRITE, HANDLE, HINSTANCE, HKEY_CURRENT_USER, HWND,
+    IDYES, INVALID_HANDLE_VALUE, MB_ICONINFORMATION, MB_SETFOREGROUND, MB_YESNO,
+    MOVEFILE_REPLACE_EXISTING, OPEN_EXISTING, PROCESS_INFORMATION, RRF_RT_REG_SZ, STARTUPINFOW,
 };
 
 pub type CalVer = [u16; 4];
@@ -795,7 +795,7 @@ unsafe fn verify_pe_header(path_utf16: &[u16]) -> bool {
 
 const TDF_ENABLE_HYPERLINKS: i32 = 0x0001;
 const TDF_ALLOW_DIALOG_CANCELLATION: i32 = 0x0008;
-const TDF_POSITION_RELATIVE_TO_WINDOW: i32 = 0x1000;
+const TDN_CREATED: u32 = 0;
 const TDN_HYPERLINK_CLICKED: u32 = 3;
 const TD_INFORMATION_ICON: *const u16 = 65533usize as *const u16;
 
@@ -860,7 +860,9 @@ unsafe extern "system" fn task_dialog_callback(
     lparam: isize,
     _ref_data: isize,
 ) -> i32 {
-    if msg == TDN_HYPERLINK_CLICKED && lparam != 0 {
+    if msg == TDN_CREATED {
+        let _ = SetForegroundWindow(hwnd);
+    } else if msg == TDN_HYPERLINK_CLICKED && lparam != 0 {
         let url_ptr = lparam as *const u16;
         let shell32 = LoadLibraryW(w!("shell32.dll"));
         if !shell32.is_null() {
@@ -1033,9 +1035,7 @@ pub fn show_update_dialog(
                     cb_size: core::mem::size_of::<TaskDialogConfig>() as u32,
                     hwnd_parent: parent,
                     h_instance: null_mut(),
-                    dw_flags: TDF_ENABLE_HYPERLINKS
-                        | TDF_ALLOW_DIALOG_CANCELLATION
-                        | TDF_POSITION_RELATIVE_TO_WINDOW,
+                    dw_flags: TDF_ENABLE_HYPERLINKS | TDF_ALLOW_DIALOG_CANCELLATION,
                     dw_common_buttons: 0,
                     psz_window_title: w!("katt"),
                     h_main_icon: TD_INFORMATION_ICON,
@@ -1097,7 +1097,12 @@ unsafe fn show_messagebox_fallback(
     msg.push_ascii("\nRelease: ");
     msg.push_ascii(release_url);
     msg.push_ascii("\n\nUpdate now?");
-    let ans = MessageBoxW(parent, msg.as_ptr(), w!("katt"), MB_YESNO | MB_ICONINFORMATION);
+    let ans = MessageBoxW(
+        parent,
+        msg.as_ptr(),
+        w!("katt"),
+        MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND,
+    );
     PromptOutcome {
         action: if ans == IDYES {
             PromptAction::UpdateNow

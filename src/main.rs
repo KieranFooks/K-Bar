@@ -511,7 +511,7 @@ unsafe fn can_prompt_update_now() -> bool {
 }
 
 #[inline(never)]
-unsafe fn maybe_show_update_prompt(hwnd: HWND) {
+unsafe fn maybe_show_update_prompt() {
     if !UPDATE_DEFERRED_PROMPT.load(Ordering::Acquire)
         || UPDATE_PROMPT_ACTIVE.swap(true, Ordering::AcqRel)
     {
@@ -527,8 +527,10 @@ unsafe fn maybe_show_update_prompt(hwnd: HWND) {
     let check = (*PENDING_UPDATE.get()).assume_init_read();
     unlock_update_tag();
 
+    // Pass null parent so the dialog centers on screen and gets a taskbar entry
+    // instead of attaching to the hidden 0x0 WS_EX_TOOLWINDOW owner at (0, 0).
     let outcome = updater::show_update_dialog(
-        hwnd as usize,
+        0,
         BUILD_VERSION,
         check.tag_str(),
         check.release_url_str(),
@@ -621,12 +623,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         WM_SYNC_WIDGET => {
             SYNC_PENDING.store(false, Ordering::Release);
             sync_widget(false);
-            maybe_show_update_prompt(hwnd);
+            maybe_show_update_prompt();
             0
         }
         WM_UPDATE_AVAILABLE => {
             UPDATE_DEFERRED_PROMPT.store(true, Ordering::Release);
-            maybe_show_update_prompt(hwnd);
+            maybe_show_update_prompt();
             0
         }
         WM_UPDATE_READY => {
@@ -686,7 +688,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_TIMER if wp == WIDGET_SYNC_TIMER_ID => {
             sync_widget(false);
-            maybe_show_update_prompt(hwnd);
+            maybe_show_update_prompt();
             0
         }
         WM_TIMER if wp == UPDATE_INITIAL_TIMER_ID => {

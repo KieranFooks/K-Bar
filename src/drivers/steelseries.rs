@@ -133,8 +133,11 @@ pub fn parse_reply(raw: &[u8], proto: SteelProto) -> Option<(Option<u8>, bool)> 
         }
         SteelProto::Arctis9 => {
             let d = strip_zero_report_id(raw);
-            if d.len() < 5 || d[0] != 0x20 {
+            if d.len() < 5 || d[0] != 0xAA {
                 return None;
+            }
+            if d[1] != 0x01 {
+                return Some((None, false));
             }
             let raw_lvl = d[3];
             if raw_lvl == 0 {
@@ -155,7 +158,7 @@ pub unsafe fn poll_handle(h: HANDLE, ev: HANDLE, pid: u16, proto: SteelProto) ->
     let (prefix, sizes): (&[u8], &[usize]) = match proto {
         SteelProto::NovaPro => (&[0x06, 0xB0], &[31, 64, 32]),
         SteelProto::Arctis7 => (&[0x06, 0x18], &[31, 32, 64]),
-        SteelProto::Arctis9 => (&[0x00, 0x20], &[65, 64, 32, 31]),
+        SteelProto::Arctis9 => (&[0x00, 0x20], &[32, 65, 64, 31]),
         _ => (&[0x00, 0xB0], &[65, 64, 32, 31]),
     };
 
@@ -206,6 +209,9 @@ mod tests {
         np[15] = 0x02;
         assert_eq!(parse_reply(&np, SteelProto::NovaPro), Some((Some(75), true)));
 
-        assert_eq!(parse_reply(&[0x00, 0x20, 0, 0, 0x7F, 0x01], SteelProto::Arctis9), Some((Some(50), true)));
+        assert_eq!(parse_reply(&[0x00, 0xAA, 0x01, 0x01, 0x77, 0x00], SteelProto::Arctis9), Some((Some(35), false)));
+        assert_eq!(parse_reply(&[0xAA, 0x01, 0x01, 0x7F, 0x01], SteelProto::Arctis9), Some((Some(50), true)));
+        assert_eq!(parse_reply(&[0xAA, 0x03, 0x01, 0x9C, 0x00], SteelProto::Arctis9), Some((None, false)));
+        assert_eq!(parse_reply(&[0x00, 0x20, 0x00, 0x00, 0x7F, 0x01], SteelProto::Arctis9), None);
     }
 }
